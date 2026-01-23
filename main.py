@@ -257,9 +257,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✨ Добро пожаловать!", reply_markup=main_menu(user_id))
 
 # ===== ОБРАБОТКА =====
+# ===== ОБРАБОТКА =====
 async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # защита от None (inline, service updates и т.д.)
+    if not update.message or not update.message.text:
+        return
+
     text = update.message.text
     user_id = update.effective_user.id
+
+    # дальше идёт ВЕСЬ твой код без изменений
 
     # гарантируем, что пользователь есть в БД
     cursor.execute("INSERT OR IGNORE INTO users (id) VALUES (?)", (user_id,))
@@ -668,4 +675,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
