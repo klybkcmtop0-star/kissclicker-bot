@@ -2,9 +2,10 @@ import sqlite3
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from datetime import datetime, timedelta
+import os
 
 # ===== НАСТРОЙКИ =====
-TOKEN = "8588883159:AAHb0mEd43jJhezkz0Q0p7s-R6pCfAqsipQ"
+TOKEN = os.getenv("TOKEN")
 ADMIN_ID = 1924971257
 CHANNEL_ID = "@kisspromochannel"
 
@@ -675,5 +676,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
