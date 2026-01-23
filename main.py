@@ -261,6 +261,10 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user_id = update.effective_user.id
 
+    # гарантируем, что пользователь есть в БД
+    cursor.execute("INSERT OR IGNORE INTO users (id) VALUES (?)", (user_id,))
+    conn.commit()
+
     # всегда проверяем VIP на истечение (и обновляем лимит если надо)
     vip_type, vip_until_dt = check_and_update_vip(user_id)
 
@@ -664,3 +668,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
