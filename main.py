@@ -77,7 +77,6 @@ CREATE TABLE IF NOT EXISTS used_promocodes (
 )
 """)
 
-# --- добавляем VIP колонки безопасно ---
 def _add_column_safe(table: str, col_def: str):
     try:
         cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col_def}")
@@ -85,9 +84,15 @@ def _add_column_safe(table: str, col_def: str):
     except:
         pass
 
+# --- VIP колонки ---
 _add_column_safe("users", "vip_type TEXT DEFAULT NULL")
-_add_column_safe("users", "vip_until TEXT DEFAULT NULL")  # ISO datetime
-_add_column_safe("users", "vip_base_limit INTEGER DEFAULT NULL")  # чтобы вернуть лимит назад
+_add_column_safe("users", "vip_until TEXT DEFAULT NULL")          # ISO datetime
+_add_column_safe("users", "vip_base_limit INTEGER DEFAULT NULL")  # вернуть лимит назад
+
+# --- Withdrawals доп. поля для админа ---
+_add_column_safe("withdrawals", "admin_note TEXT DEFAULT NULL")
+_add_column_safe("withdrawals", "decided_at TEXT DEFAULT NULL")   # ISO datetime
+
 conn.commit()
 
 # ===== МЕНЮ =====
@@ -179,11 +184,6 @@ def parse_duration(value: str, unit: str):
     return None
 
 def check_and_update_vip(user_id: int):
-    """
-    Проверяет VIP срок.
-    Если истёк — снимает VIP и возвращает clicks_limit в vip_base_limit или DEFAULT_CLICKS_LIMIT.
-    Возвращает (vip_type или None, vip_until_dt или None)
-    """
     cursor.execute("SELECT vip_type, vip_until, vip_base_limit FROM users WHERE id=?", (user_id,))
     row = cursor.fetchone()
     if not row:
@@ -196,7 +196,6 @@ def check_and_update_vip(user_id: int):
     try:
         until_dt = datetime.fromisoformat(vip_until)
     except:
-        # если вдруг кривое значение — сбросим
         cursor.execute("UPDATE users SET vip_type=NULL, vip_until=NULL, vip_base_limit=NULL WHERE id=?", (user_id,))
         conn.commit()
         return None, None
@@ -211,15 +210,19 @@ def check_and_update_vip(user_id: int):
         conn.commit()
         return None, None
 
-    # VIP активен
     return vip_type, until_dt
 
 def get_display_nick(update: Update, vip_type: str | None):
-    # Ник: @username если есть, иначе first_name
     u = update.effective_user
     base = f"@{u.username}" if u.username else (u.first_name or "User")
     icon = VIP_ICONS.get(vip_type, "") if vip_type else ""
     return f"{base}{icon}"
+
+def now_iso():
+    return datetime.now().isoformat(timespec="seconds")
+
+def now_human():
+    return datetime.now().strftime("%d.%m.%Y %H:%M")
 
 # ===== СТАРТ =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -257,23 +260,116 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["menu"] = "main"
     await update.message.reply_text("✨ Добро пожаловать!", reply_markup=main_menu(user_id))
 
-# ===== ОБРАБОТКА =====
+# ====== ВЫВОД: АДМИН КОМАНДЫ done/cancel ======
+async def admin_process_withdraw_decision(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """
+    done 3 [msg...]
+    cancel 3 [reason...]
+    """
+    lower = text.strip().lower()
+    if not (lower.startswith("done ") or lower.startswith("cancel ")):
+        return False
+
+    parts = text.strip().split(maxsplit=2)  # cmd, id, msg
+    if len(parts) < 2:
+        await update.message.reply_text("❌ Формат:\n done 3 текст\n cancel 3 причина", reply_markup=admin_menu())
+        return True
+
+    cmd = parts[0].lower()
+    try:
+        wid = int(parts[1].lstrip("#"))
+    except:
+        await update.message.reply_text("❌ ID заявки должен быть числом. Пример: done 3", reply_markup=admin_menu())
+        return True
+
+    admin_note = parts[2] if len(parts) >= 3 else ""
+
+    cursor.execute("SELECT user_id, amount, requisites, status FROM withdrawals WHERE id=?", (wid,))
+    row = cursor.fetchone()
+    if not row:
+        await update.message.reply_text("❌ Заявка не найдена.", reply_markup=admin_menu())
+        return True
+
+    target_uid, amount, requisites, status = row
+    if status != "pending":
+        await update.message.reply_text("❌ Эта заявка уже обработана.", reply_markup=admin_menu())
+        return True
+
+    decided_at = now_iso()
+
+    if cmd == "done":
+        cursor.execute(
+            "UPDATE withdrawals SET status='approved', admin_note=?, decided_at=? WHERE id=?",
+            (admin_note, decided_at, wid)
+        )
+        conn.commit()
+
+        msg_user = (
+            "✅ Ваша заявка на вывод подтверждена\n"
+            f"💰 Сумма: {amount} GOLD\n"
+            "🕒 Ожидайте зачисление (или уже отправлено)\n"
+        )
+        if admin_note.strip():
+            msg_user += f"\n💬 Сообщение от админа: {admin_note.strip()}"
+
+        try:
+            await context.bot.send_message(chat_id=target_uid, text=msg_user)
+        except:
+            pass
+
+        await update.message.reply_text(
+            f"✅ Готово. Заявка #{wid} подтверждена.\n"
+            f"Пользователь: {target_uid}\n"
+            f"Сумма: {amount} GOLD",
+            reply_markup=admin_menu()
+        )
+        return True
+
+    if cmd == "cancel":
+        # Возврат денег
+        cursor.execute("UPDATE users SET balance=balance+? WHERE id=?", (amount, target_uid))
+        cursor.execute(
+            "UPDATE withdrawals SET status='declined', admin_note=?, decided_at=? WHERE id=?",
+            (admin_note, decided_at, wid)
+        )
+        conn.commit()
+
+        msg_user = (
+            "❌ Ваша заявка на вывод отклонена\n"
+            f"💰 Сумма: {amount} GOLD\n"
+            "↩️ Средства возвращены на баланс.\n"
+        )
+        if admin_note.strip():
+            msg_user += f"\n💬 Причина: {admin_note.strip()}"
+
+        try:
+            await context.bot.send_message(chat_id=target_uid, text=msg_user)
+        except:
+            pass
+
+        await update.message.reply_text(
+            f"✅ Отклонено. Заявка #{wid} закрыта.\n"
+            f"Пользователь: {target_uid}\n"
+            f"Сумма: {amount} GOLD (возврат сделан)",
+            reply_markup=admin_menu()
+        )
+        return True
+
+    return False
+
 # ===== ОБРАБОТКА =====
 async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # защита от None (inline, service updates и т.д.)
     if not update.message or not update.message.text:
         return
 
     text = update.message.text
     user_id = update.effective_user.id
 
-    # дальше идёт ВЕСЬ твой код без изменений
-
-    # гарантируем, что пользователь есть в БД
+    # гарантируем юзера в БД
     cursor.execute("INSERT OR IGNORE INTO users (id) VALUES (?)", (user_id,))
     conn.commit()
 
-    # всегда проверяем VIP на истечение (и обновляем лимит если надо)
+    # VIP чек
     vip_type, vip_until_dt = check_and_update_vip(user_id)
 
     # бан (кроме админа)
@@ -286,7 +382,6 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # НАЗАД / ОТМЕНА
     if text in ["🔙 Назад", "❌ Отмена"]:
-        # если отменяем админ-действие — вернемся в админ-меню
         if user_id == ADMIN_ID and context.user_data.get("admin_action"):
             context.user_data.pop("admin_action", None)
             context.user_data["menu"] = "admin"
@@ -310,11 +405,11 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ПРОФИЛЬ
     if text == "👤 Профиль":
-        # пересчитаем VIP прямо перед выводом
         vip_type, vip_until_dt = check_and_update_vip(user_id)
 
         cursor.execute("SELECT balance, clicks_used, clicks_limit FROM users WHERE id=?", (user_id,))
-        bal, used, limit = cursor.fetchone()
+        row = cursor.fetchone()
+        bal, used, limit = row if row else (0, 0, DEFAULT_CLICKS_LIMIT)
 
         used, next_reset, limit = check_click_reset(user_id)
 
@@ -421,7 +516,8 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ВЫВОД
     if text == "💸 Вывод":
         cursor.execute("SELECT balance FROM users WHERE id=?", (user_id,))
-        bal = cursor.fetchone()[0]
+        row = cursor.fetchone()
+        bal = row[0] if row else 0
         if bal < MIN_WITHDRAW:
             await update.message.reply_text(f"❌ Минимум {MIN_WITHDRAW} GOLD", reply_markup=main_menu(user_id))
             return
@@ -433,27 +529,38 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             amount = float(text)
             cursor.execute("SELECT balance FROM users WHERE id=?", (user_id,))
-            bal = cursor.fetchone()[0]
+            row = cursor.fetchone()
+            bal = row[0] if row else 0
             if amount < MIN_WITHDRAW or amount > bal:
                 await update.message.reply_text("❌ Неверная сумма", reply_markup=cancel_menu())
                 return
             context.user_data["withdraw_amount"] = amount
             context.user_data["withdraw_step"] = "requisites"
-            await update.message.reply_text("Введите реквизиты:", reply_markup=cancel_menu())
+            await update.message.reply_text(
+                "Введите свои реквизиты:\nTelegram Username / ID",
+                reply_markup=cancel_menu()
+            )
         except:
             await update.message.reply_text("❌ Введите число", reply_markup=cancel_menu())
         return
 
     if context.user_data.get("withdraw_step") == "requisites":
         amount = context.user_data["withdraw_amount"]
-        requisites = text
-        cursor.execute("INSERT INTO withdrawals (user_id, amount, requisites) VALUES (?,?,?)",
-                       (user_id, amount, requisites))
+        requisites = text.strip()
+
+        cursor.execute(
+            "INSERT INTO withdrawals (user_id, amount, requisites, status) VALUES (?,?,?, 'pending')",
+            (user_id, amount, requisites)
+        )
         cursor.execute("UPDATE users SET balance=balance-? WHERE id=?", (amount, user_id))
         conn.commit()
-        now = datetime.now().strftime("%d.%m.%Y %H:%M")
+
         await update.message.reply_text(
-            f"✅ Заявка отправлена!\n💰 {amount} GOLD\n✍ {requisites}\n🕒 {now}",
+            f"✅ Заявка отправлена!\n"
+            f"💰 {amount} GOLD\n"
+            f"✍️ {requisites}\n"
+            f"🕒 {now_human()}\n\n"
+            f"⏳ Регламент вывода: в течение 24 часов. Ожидайте ✅",
             reply_markup=main_menu(user_id)
         )
         context.user_data.clear()
@@ -471,8 +578,20 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.user_data["menu"] = "admin"
         context.user_data.pop("admin_action", None)
-        await update.message.reply_text("🛠 Админ панель", reply_markup=admin_menu())
+        await update.message.reply_text(
+            "🛠 Админ панель\n\n"
+            "Команды для вывода:\n"
+            "✅ done 3 текст\n"
+            "❌ cancel 3 причина",
+            reply_markup=admin_menu()
+        )
         return
+
+    # если админ пишет done/cancel — обрабатываем сразу
+    if user_id == ADMIN_ID:
+        handled = await admin_process_withdraw_decision(update, context, text)
+        if handled:
+            return
 
     # кнопки админки (запуск действий)
     if user_id == ADMIN_ID and menu == "admin" and admin_action is None:
@@ -518,9 +637,22 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if text == "📋 Заявки на вывод":
-            cursor.execute("SELECT id, user_id, amount, status FROM withdrawals ORDER BY id DESC")
+            cursor.execute("""
+                SELECT id, user_id, amount, requisites
+                FROM withdrawals
+                WHERE status='pending'
+                ORDER BY id DESC
+            """)
             rows = cursor.fetchall()
-            msg = "\n".join([f"#{r[0]} | {r[1]} | {r[2]} GOLD | {r[3]}" for r in rows]) or "Нет заявок"
+            if not rows:
+                await update.message.reply_text("Нет заявок ✅", reply_markup=admin_menu())
+                return
+
+            msg = "📋 Заявки (pending):\n\n"
+            for wid, uid, amount, req in rows[:50]:
+                msg += f"#{wid} | {uid} | {amount} GOLD\n✍️ {req}\n\n"
+
+            msg += "Команды:\n✅ done 3 текст\n❌ cancel 3 причина"
             await update.message.reply_text(msg, reply_markup=admin_menu())
             return
 
@@ -560,6 +692,7 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text("❌ Формат: ID СУММА", reply_markup=cancel_menu())
                     return
                 uid, amount = int(parts[0]), float(parts[1])
+                cursor.execute("INSERT OR IGNORE INTO users (id) VALUES (?)", (uid,))
                 cursor.execute("UPDATE users SET balance=balance+? WHERE id=?", (amount, uid))
                 conn.commit()
                 await update.message.reply_text(f"✅ Выдано {amount} GOLD пользователю {uid}", reply_markup=admin_menu())
@@ -569,6 +702,7 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text("❌ Формат: ID СУММА", reply_markup=cancel_menu())
                     return
                 uid, amount = int(parts[0]), float(parts[1])
+                cursor.execute("INSERT OR IGNORE INTO users (id) VALUES (?)", (uid,))
                 cursor.execute("UPDATE users SET balance=balance-? WHERE id=?", (amount, uid))
                 conn.commit()
                 await update.message.reply_text(f"✅ Снято {amount} GOLD у пользователя {uid}", reply_markup=admin_menu())
@@ -578,6 +712,7 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text("❌ Формат: ID", reply_markup=cancel_menu())
                     return
                 uid = int(parts[0])
+                cursor.execute("INSERT OR IGNORE INTO users (id) VALUES (?)", (uid,))
                 cursor.execute("SELECT banned FROM users WHERE id=?", (uid,))
                 row = cursor.fetchone()
                 banned = row[0] if row else 0
@@ -594,12 +729,12 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text("❌ Формат: ID НОВЫЙ_ЛИМИТ", reply_markup=cancel_menu())
                     return
                 uid, limit = int(parts[0]), int(parts[1])
+                cursor.execute("INSERT OR IGNORE INTO users (id) VALUES (?)", (uid,))
                 cursor.execute("UPDATE users SET clicks_limit=? WHERE id=?", (limit, uid))
                 conn.commit()
                 await update.message.reply_text(f"✅ Лимит кликов для {uid} = {limit}", reply_markup=admin_menu())
 
             elif admin_action == "give_vip":
-                # ID VIP 1 час / ID MVP 300 минут / ID PREMIUM 2 дня
                 if len(parts) != 4:
                     await update.message.reply_text(
                         "❌ Формат:\nID VIP 1 час\nID MVP 300 минут\nID PREMIUM 2 дня",
@@ -620,7 +755,7 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text("❌ Время: минут/час/дня (пример: 300 минут / 1 час / 2 дня)", reply_markup=cancel_menu())
                     return
 
-                # запомним текущий лимит, чтобы вернуть потом
+                cursor.execute("INSERT OR IGNORE INTO users (id) VALUES (?)", (uid,))
                 cursor.execute("SELECT clicks_limit FROM users WHERE id=?", (uid,))
                 row = cursor.fetchone()
                 current_limit = row[0] if row else DEFAULT_CLICKS_LIMIT
@@ -676,6 +811,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
