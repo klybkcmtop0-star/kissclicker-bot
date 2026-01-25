@@ -1,10 +1,11 @@
 import os
 import logging
+import time
 from datetime import datetime, timedelta
-from typing import Optional, Tuple
+from typing import Optional
 
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2 import OperationalError, InterfaceError, DatabaseError
 
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.error import TimedOut, Conflict
@@ -19,8 +20,8 @@ from telegram.ext import (
 # =========================
 # ===== НАСТРОЙКИ =========
 # =========================
-TOKEN = os.getenv("TOKEN")  # Railway Variables -> TOKEN
-DATABASE_URL = os.getenv("DATABASE_URL")  # Railway Variables -> DATABASE_URL (из Postgres)
+TOKEN = os.getenv("TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")  # Railway Variables -> DATABASE_URL (Variable Reference из Postgres)
 ADMIN_ID = 1924971257
 CHANNEL_ID = "@kisspromochannel"
 
@@ -46,28 +47,103 @@ logger = logging.getLogger("kissclicker-bot")
 # =========================
 # ===== POSTGRES DB =======
 # =========================
-def db_connect():
+_conn = None
+
+
+def _choose_sslmode(url: str) -> str:
+    # Railway internal network обычно НЕ требует SSL, и иногда "require" ломает подключение
+    # Если URL публичный (не internal) — require.
+    return "disable" if "railway.internal" in url else "require"
+
+
+def db_connect(retries: int = 10, sleep_s: float = 1.5):
+    global _conn
+
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL не найден. Добавь Railway Variables -> DATABASE_URL (из Postgres).")
-    # Railway Postgres обычно требует SSL
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
 
-conn = db_connect()
-conn.autocommit = True
+    sslmode = _choose_sslmode(DATABASE_URL)
+    last_err = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            c = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+            c.autocommit = True
+            _conn = c
+            logger.info(f"✅ Postgres connected (sslmode={sslmode})")
+            return
+        except Exception as e:
+            last_err = e
+            logger.warning(f"DB connect failed ({attempt}/{retries}): {e}")
+            time.sleep(sleep_s)
+
+    raise RuntimeError(f"Не удалось подключиться к Postgres: {last_err}")
+
+
+def db_get_conn():
+    global _conn
+    if _conn is None:
+        db_connect()
+    return _conn
+
 
 def db_exec(query: str, params: tuple = ()):
-    with conn.cursor() as cur:
-        cur.execute(query, params)
+    """Exec с авто-reconnect если соединение отвалилось."""
+    for _ in range(2):
+        try:
+            conn = db_get_conn()
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+            return
+        except (OperationalError, InterfaceError) as e:
+            logger.warning(f"db_exec reconnect due to: {e}")
+            try:
+                if _conn:
+                    _conn.close()
+            except Exception:
+                pass
+            # переподключаемся
+            db_connect()
+        except DatabaseError as e:
+            # SQL ошибка — не лечится reconnect'ом
+            raise e
+
 
 def db_fetchone(query: str, params: tuple = ()):
-    with conn.cursor() as cur:
-        cur.execute(query, params)
-        return cur.fetchone()
+    for _ in range(2):
+        try:
+            conn = db_get_conn()
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                return cur.fetchone()
+        except (OperationalError, InterfaceError) as e:
+            logger.warning(f"db_fetchone reconnect due to: {e}")
+            try:
+                if _conn:
+                    _conn.close()
+            except Exception:
+                pass
+            db_connect()
+    return None
+
 
 def db_fetchall(query: str, params: tuple = ()):
-    with conn.cursor() as cur:
-        cur.execute(query, params)
-        return cur.fetchall()
+    for _ in range(2):
+        try:
+            conn = db_get_conn()
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                return cur.fetchall()
+        except (OperationalError, InterfaceError) as e:
+            logger.warning(f"db_fetchall reconnect due to: {e}")
+            try:
+                if _conn:
+                    _conn.close()
+            except Exception:
+                pass
+            db_connect()
+    return []
+
 
 def column_exists(table: str, column: str) -> bool:
     row = db_fetchone(
@@ -80,6 +156,7 @@ def column_exists(table: str, column: str) -> bool:
     )
     return row is not None
 
+
 def add_column_safe(table: str, col_def: str, col_name: str):
     try:
         if not column_exists(table, col_name):
@@ -87,8 +164,8 @@ def add_column_safe(table: str, col_def: str, col_name: str):
     except Exception as e:
         logger.warning(f"add_column_safe failed: {e}")
 
+
 def init_db():
-    # users
     db_exec(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -103,7 +180,6 @@ def init_db():
         """
     )
 
-    # referrals
     db_exec(
         """
         CREATE TABLE IF NOT EXISTS referrals (
@@ -114,7 +190,6 @@ def init_db():
         """
     )
 
-    # withdrawals
     db_exec(
         """
         CREATE TABLE IF NOT EXISTS withdrawals (
@@ -127,7 +202,6 @@ def init_db():
         """
     )
 
-    # promocodes
     db_exec(
         """
         CREATE TABLE IF NOT EXISTS promocodes (
@@ -138,7 +212,6 @@ def init_db():
         """
     )
 
-    # used_promocodes
     db_exec(
         """
         CREATE TABLE IF NOT EXISTS used_promocodes (
@@ -158,7 +231,6 @@ def init_db():
     add_column_safe("withdrawals", "admin_note TEXT DEFAULT NULL", "admin_note")
     add_column_safe("withdrawals", "decided_at TEXT DEFAULT NULL", "decided_at")
 
-init_db()
 
 # =========================
 # ===== МЕНЮ ==============
@@ -173,8 +245,10 @@ def main_menu(user_id: int):
         buttons.append(["🛠 Админка"])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
+
 def earn_menu():
     return ReplyKeyboardMarkup([["👆 КЛИК"], ["🔙 Назад"]], resize_keyboard=True)
+
 
 def admin_menu():
     return ReplyKeyboardMarkup(
@@ -188,11 +262,14 @@ def admin_menu():
         resize_keyboard=True,
     )
 
+
 def cancel_menu():
     return ReplyKeyboardMarkup([["❌ Отмена"], ["🔙 Назад"]], resize_keyboard=True)
 
+
 def subscribe_menu():
     return ReplyKeyboardMarkup([["🔔 Подписаться"], ["✅ Я подписался"]], resize_keyboard=True)
+
 
 # =========================
 # ===== ВСПОМОГАТЕЛЬНОЕ ===
@@ -210,6 +287,7 @@ async def safe_reply(update: Update, text: str, reply_markup=None):
     except Exception as e:
         logger.warning(f"safe_reply failed: {e}")
 
+
 async def is_subscribed(bot, user_id: int):
     try:
         member = await bot.get_chat_member(CHANNEL_ID, user_id)
@@ -217,14 +295,18 @@ async def is_subscribed(bot, user_id: int):
     except Exception:
         return False
 
+
 def now_iso():
     return datetime.now().isoformat(timespec="seconds")
+
 
 def now_human():
     return datetime.now().strftime("%d.%m.%Y %H:%M")
 
+
 def ensure_user(user_id: int):
     db_exec("INSERT INTO users (id) VALUES (%s) ON CONFLICT (id) DO NOTHING", (user_id,))
+
 
 def check_click_reset(user_id: int):
     row = db_fetchone("SELECT last_click_reset, clicks_used, clicks_limit FROM users WHERE id=%s", (user_id,))
@@ -249,6 +331,7 @@ def check_click_reset(user_id: int):
 
     return row[1], next_reset, row[2]
 
+
 def format_time_left(td: timedelta):
     seconds = int(td.total_seconds())
     if seconds < 0:
@@ -262,6 +345,7 @@ def format_time_left(td: timedelta):
         return f"{hours}ч {minutes}м"
     return f"{minutes}м"
 
+
 def parse_duration(value: str, unit: str):
     v = int(value)
     u = unit.lower()
@@ -272,6 +356,7 @@ def parse_duration(value: str, unit: str):
     if u.startswith("дн"):
         return timedelta(days=v)
     return None
+
 
 def check_and_update_vip(user_id: int):
     row = db_fetchone("SELECT vip_type, vip_until, vip_base_limit FROM users WHERE id=%s", (user_id,))
@@ -299,11 +384,13 @@ def check_and_update_vip(user_id: int):
 
     return vip_type, until_dt
 
+
 def get_display_nick(update: Update, vip_type: Optional[str]):
     u = update.effective_user
     base = f"@{u.username}" if u.username else (u.first_name or "User")
     icon = VIP_ICONS.get(vip_type, "") if vip_type else ""
     return f"{base}{icon}"
+
 
 # =========================
 # ===== СТАРТ =============
@@ -341,8 +428,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["menu"] = "main"
     await safe_reply(update, "✨ Добро пожаловать!", reply_markup=main_menu(user_id))
 
+
 # =========================
-# ===== ВЫВОД done/cancel=
+# ===== ВЫВОД done/cancel==
 # =========================
 async def admin_process_withdraw_decision(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     lower = text.strip().lower()
@@ -429,6 +517,7 @@ async def admin_process_withdraw_decision(update: Update, context: ContextTypes.
         return True
 
     return False
+
 
 # =========================
 # ===== ОБРАБОТКА =========
@@ -562,7 +651,10 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 db_exec("UPDATE users SET balance=balance+%s WHERE id=%s", (amount, user_id))
                 db_exec("UPDATE promocodes SET uses_left=uses_left-1 WHERE code=%s", (text,))
-                db_exec("INSERT INTO used_promocodes (user_id, code) VALUES (%s, %s) ON CONFLICT DO NOTHING", (user_id, text))
+                db_exec(
+                    "INSERT INTO used_promocodes (user_id, code) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                    (user_id, text),
+                )
                 await safe_reply(update, f"🎉 ПРОМО АКТИВИРОВАН\n💰 +{amount} GOLD", reply_markup=main_menu(user_id))
         context.user_data.clear()
         return
@@ -828,6 +920,7 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await safe_reply(update, "Выберите пункт меню 👇", reply_markup=main_menu(user_id))
 
+
 # =========================
 # ===== ERROR HANDLER =====
 # =========================
@@ -838,6 +931,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         return
     logger.exception("Unhandled error:", exc_info=err)
 
+
 # =========================
 # ===== MAIN ==============
 # =========================
@@ -847,6 +941,9 @@ def main():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL не найден. Добавь Railway Variables -> DATABASE_URL (из Postgres)")
 
+    db_connect()
+    init_db()
+
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handler))
@@ -854,6 +951,7 @@ def main():
 
     print("✅ Бот запущен")
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
