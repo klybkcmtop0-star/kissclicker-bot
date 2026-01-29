@@ -33,7 +33,7 @@ CLICK_REWARD = 1
 MIN_WITHDRAW = 1000
 
 DEFAULT_CLICKS_LIMIT = 1500
-CLICK_RESET_HOURS = 2  # ✅ было 12 -> стало 2
+CLICK_RESET_HOURS = 3  # ✅ было 12 -> стало 3
 REF_REWARD = 150
 
 DAILY_BONUS_AMOUNT = 500
@@ -1221,3 +1221,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
