@@ -3,23 +3,16 @@ import logging
 import time
 from datetime import datetime, timedelta
 from typing import Optional
-from urllib.parse import urlparse, unquote
 
 import psycopg2
-from psycopg2 import OperationalError
+from psycopg2.extras import RealDictCursor
 
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.error import TimedOut, Conflict
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -28,8 +21,7 @@ from telegram.ext import (
 # ===== НАСТРОЙКИ =========
 # =========================
 TOKEN = os.getenv("TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
-
+DATABASE_URL = os.getenv("DATABASE_URL")  # Railway -> Variables -> DATABASE_URL
 ADMIN_ID = 1924971257
 CHANNEL_ID = "@kisspromochannel"
 
@@ -37,20 +29,11 @@ CLICK_REWARD = 1
 MIN_WITHDRAW = 1000
 
 DEFAULT_CLICKS_LIMIT = 1500
-CLICK_RESET_HOURS = 2   # ✅ было 12, стало 2 часа
+CLICK_RESET_HOURS = 12  # можешь поменять на 2 потом
 REF_REWARD = 150
-
-DAILY_BONUS_AMOUNT = 500
-DAILY_BONUS_HOURS = 24
 
 VIP_LIMITS = {"VIP": 2500, "MVP": 3000, "PREMIUM": 4000}
 VIP_ICONS = {"VIP": "🏆", "MVP": "💎", "PREMIUM": "💲"}
-
-REF_TIER_REWARDS = [
-    (10, 1000),
-    (50, 5000),
-    (100, 10000),
-]
 
 # =========================
 # ===== ЛОГИ ==============
@@ -66,50 +49,53 @@ logger = logging.getLogger("kissclicker-bot")
 # =========================
 conn = None
 
-def parse_database_url(url: str) -> dict:
+def _parse_db_url(db_url: str) -> dict:
     """
-    Делает psycopg2 kwargs из postgres URL.
-    Работает даже если psycopg2/railway не понимает URI напрямую.
+    psycopg2 иногда ругается на URI как на "dsn".
+    Поэтому парсим URL сами и подключаемся через kwargs.
     """
-    p = urlparse(url)
-    if p.scheme not in ("postgres", "postgresql"):
+    from urllib.parse import urlparse, unquote
+
+    u = urlparse(db_url)
+    if u.scheme not in ("postgres", "postgresql"):
         raise RuntimeError("DATABASE_URL должен начинаться с postgres:// или postgresql://")
 
-    user = unquote(p.username) if p.username else None
-    password = unquote(p.password) if p.password else None
-    host = p.hostname
-    port = p.port or 5432
-    dbname = p.path.lstrip("/") if p.path else None
+    user = unquote(u.username) if u.username else None
+    password = unquote(u.password) if u.password else None
+    host = u.hostname
+    port = u.port or 5432
+    dbname = u.path.lstrip("/") if u.path else "railway"
 
-    if not host or not dbname:
-        raise RuntimeError("DATABASE_URL некорректный (нет host или dbname)")
+    if not host:
+        raise RuntimeError("DATABASE_URL без host (хоста)")
 
     return {
-        "user": user,
-        "password": password,
         "host": host,
         "port": port,
         "dbname": dbname,
-        "sslmode": "require",
+        "user": user,
+        "password": password,
+        "sslmode": "require",  # Railway Postgres обычно требует SSL
     }
 
-def db_connect(retries: int = 10, delay: float = 1.5):
+def db_connect():
     global conn
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL не найден. Добавь Railway Variables -> DATABASE_URL")
+        raise RuntimeError("DATABASE_URL не найден. Railway -> Variables -> DATABASE_URL")
+
+    cfg = _parse_db_url(DATABASE_URL)
 
     last_err = None
-    for i in range(1, retries + 1):
+    for attempt in range(1, 11):
         try:
-            kwargs = parse_database_url(DATABASE_URL)
-            conn = psycopg2.connect(**kwargs)
+            conn = psycopg2.connect(**cfg)
             conn.autocommit = True
             logger.info("✅ Postgres connected")
             return
         except Exception as e:
             last_err = e
-            logger.warning(f"DB connect failed ({i}/{retries}): {e}")
-            time.sleep(delay)
+            logger.warning(f"DB connect failed ({attempt}/10): {e}")
+            time.sleep(1.5)
 
     raise RuntimeError(f"Не удалось подключиться к Postgres: {last_err}")
 
@@ -138,15 +124,7 @@ def init_db():
             clicks_used INTEGER DEFAULT 0,
             clicks_limit INTEGER DEFAULT 1500,
             last_click_reset TEXT,
-            subscribed INTEGER DEFAULT 0,
-
-            -- ✅ новое
-            total_clicks BIGINT DEFAULT 0,
-            daily_bonus_last TEXT,
-
-            vip_type TEXT DEFAULT NULL,
-            vip_until TEXT DEFAULT NULL,
-            vip_base_limit INTEGER DEFAULT NULL
+            subscribed INTEGER DEFAULT 0
         )
         """
     )
@@ -170,10 +148,7 @@ def init_db():
             user_id BIGINT,
             amount DOUBLE PRECISION,
             requisites TEXT,
-            status TEXT DEFAULT 'pending',
-
-            admin_note TEXT DEFAULT NULL,
-            decided_at TEXT DEFAULT NULL
+            status TEXT DEFAULT 'pending'
         )
         """
     )
@@ -200,16 +175,43 @@ def init_db():
         """
     )
 
-    # ✅ реф-награды (чтобы 10/50/100 можно было забрать 1 раз)
+    # безопасное добавление колонок (Postgres)
     db_exec(
         """
-        CREATE TABLE IF NOT EXISTS ref_rewards_claimed (
-            user_id BIGINT,
-            tier INTEGER,
-            PRIMARY KEY(user_id, tier)
-        )
+        DO $$
+        BEGIN
+            -- users
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='vip_type')
+                THEN ALTER TABLE users ADD COLUMN vip_type TEXT DEFAULT NULL;
+            END IF;
+
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='vip_until')
+                THEN ALTER TABLE users ADD COLUMN vip_until TEXT DEFAULT NULL;
+            END IF;
+
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='vip_base_limit')
+                THEN ALTER TABLE users ADD COLUMN vip_base_limit INTEGER DEFAULT NULL;
+            END IF;
+
+            -- ВАЖНО: total_clicks (чтобы профиль не падал)
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='total_clicks')
+                THEN ALTER TABLE users ADD COLUMN total_clicks BIGINT DEFAULT 0;
+            END IF;
+
+            -- withdrawals admin
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='withdrawals' AND column_name='admin_note')
+                THEN ALTER TABLE withdrawals ADD COLUMN admin_note TEXT DEFAULT NULL;
+            END IF;
+
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='withdrawals' AND column_name='decided_at')
+                THEN ALTER TABLE withdrawals ADD COLUMN decided_at TEXT DEFAULT NULL;
+            END IF;
+        END $$;
         """
     )
+
+def ensure_user(user_id: int):
+    db_exec("INSERT INTO users (id) VALUES (%s) ON CONFLICT (id) DO NOTHING", (user_id,))
 
 # =========================
 # ===== МЕНЮ ==============
@@ -245,28 +247,6 @@ def cancel_menu():
 def subscribe_menu():
     return ReplyKeyboardMarkup([["🔔 Подписаться"], ["✅ Я подписался"]], resize_keyboard=True)
 
-def profile_inline_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎁 Ежедневный бонус", callback_data="daily_bonus")],
-        [InlineKeyboardButton("🏆 ТОПЫ", callback_data="tops")],
-        [InlineKeyboardButton("🎯 Бонусы за рефералов", callback_data="ref_rewards")],
-    ])
-
-def tops_inline_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔥 Топ по кликам", callback_data="top_clicks")],
-        [InlineKeyboardButton("💰 Топ по балансу", callback_data="top_balance")],
-        [InlineKeyboardButton("👥 Топ рефоводов", callback_data="top_refs")],
-        [InlineKeyboardButton("🔙 Назад", callback_data="back_profile")],
-    ])
-
-def ref_rewards_inline_menu():
-    rows = []
-    for tier, reward in REF_TIER_REWARDS:
-        rows.append([InlineKeyboardButton(f"✅ Забрать за {tier} рефов (+{reward}G)", callback_data=f"claim_ref_{tier}")])
-    rows.append([InlineKeyboardButton("🔙 Назад", callback_data="back_profile")])
-    return InlineKeyboardMarkup(rows)
-
 # =========================
 # ===== ВСПОМОГАТЕЛЬНОЕ ===
 # =========================
@@ -295,9 +275,6 @@ def now_iso():
 
 def now_human():
     return datetime.now().strftime("%d.%m.%Y %H:%M")
-
-def ensure_user(user_id: int):
-    db_exec("INSERT INTO users (id) VALUES (%s) ON CONFLICT (id) DO NOTHING", (user_id,))
 
 def check_click_reset(user_id: int):
     row = db_fetchone("SELECT last_click_reset, clicks_used, clicks_limit FROM users WHERE id=%s", (user_id,))
@@ -378,18 +355,6 @@ def get_display_nick(update: Update, vip_type: Optional[str]):
     icon = VIP_ICONS.get(vip_type, "") if vip_type else ""
     return f"{base}{icon}"
 
-def get_subscribed_refs_count(referrer_id: int) -> int:
-    row = db_fetchone(
-        """
-        SELECT COUNT(*)
-        FROM referrals r
-        JOIN users u ON u.id = r.user_id
-        WHERE r.referrer_id=%s AND u.subscribed=1
-        """,
-        (referrer_id,),
-    )
-    return int(row[0]) if row else 0
-
 # =========================
 # ===== СТАРТ =============
 # =========================
@@ -465,7 +430,6 @@ async def admin_process_withdraw_decision(update: Update, context: ContextTypes.
             "UPDATE withdrawals SET status='approved', admin_note=%s, decided_at=%s WHERE id=%s",
             (admin_note, decided_at, wid),
         )
-
         msg_user = (
             "✅ Ваша заявка на вывод подтверждена\n"
             f"💰 Сумма: {amount} GOLD\n"
@@ -473,17 +437,11 @@ async def admin_process_withdraw_decision(update: Update, context: ContextTypes.
         )
         if admin_note.strip():
             msg_user += f"\n💬 Сообщение: {admin_note.strip()}"
-
         try:
             await context.bot.send_message(chat_id=target_uid, text=msg_user)
         except Exception:
             pass
-
-        await safe_reply(
-            update,
-            f"✅ Готово. Заявка #{wid} подтверждена.\nПользователь: {target_uid}\nСумма: {amount} GOLD",
-            reply_markup=admin_menu(),
-        )
+        await safe_reply(update, f"✅ Готово. Заявка #{wid} подтверждена.", reply_markup=admin_menu())
         return True
 
     if cmd == "cancel":
@@ -492,7 +450,6 @@ async def admin_process_withdraw_decision(update: Update, context: ContextTypes.
             "UPDATE withdrawals SET status='declined', admin_note=%s, decided_at=%s WHERE id=%s",
             (admin_note, decided_at, wid),
         )
-
         msg_user = (
             "❌ Ваша заявка на вывод отклонена\n"
             f"💰 Сумма: {amount} GOLD\n"
@@ -500,220 +457,14 @@ async def admin_process_withdraw_decision(update: Update, context: ContextTypes.
         )
         if admin_note.strip():
             msg_user += f"\n💬 Причина: {admin_note.strip()}"
-
         try:
             await context.bot.send_message(chat_id=target_uid, text=msg_user)
         except Exception:
             pass
-
-        await safe_reply(
-            update,
-            f"✅ Отклонено. Заявка #{wid} закрыта.\nПользователь: {target_uid}\nСумма: {amount} GOLD (возврат сделан)",
-            reply_markup=admin_menu(),
-        )
+        await safe_reply(update, f"✅ Отклонено. Заявка #{wid} закрыта.", reply_markup=admin_menu())
         return True
 
     return False
-
-# =========================
-# ===== INLINE HANDLER =====
-# =========================
-async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not q:
-        return
-    await q.answer()
-
-    user_id = q.from_user.id
-    ensure_user(user_id)
-
-    data = q.data
-
-    # Назад в профиль
-    if data == "back_profile":
-        # просто переоткроем профиль
-        await send_profile(q, context, edit=True)
-        return
-
-    # Ежедневный бонус
-    if data == "daily_bonus":
-        row = db_fetchone("SELECT daily_bonus_last FROM users WHERE id=%s", (user_id,))
-        last = row[0] if row else None
-        now = datetime.now()
-
-        if last:
-            try:
-                last_dt = datetime.fromisoformat(last)
-            except Exception:
-                last_dt = None
-
-            if last_dt:
-                next_time = last_dt + timedelta(hours=DAILY_BONUS_HOURS)
-                if now < next_time:
-                    left = format_time_left(next_time - now)
-                    await q.edit_message_text(
-                        f"🎁 Ежедневный бонус уже получен.\n⏳ Попробуй через: {left}",
-                        reply_markup=profile_inline_menu(),
-                    )
-                    return
-
-        db_exec(
-            "UPDATE users SET balance=balance+%s, daily_bonus_last=%s WHERE id=%s",
-            (DAILY_BONUS_AMOUNT, now_iso(), user_id),
-        )
-        await q.edit_message_text(
-            f"🎉 Бонус получен!\n💰 +{DAILY_BONUS_AMOUNT} GOLD",
-            reply_markup=profile_inline_menu(),
-        )
-        return
-
-    # ТОПЫ
-    if data == "tops":
-        await q.edit_message_text("🏆 ТОПЫ\nВыбери категорию:", reply_markup=tops_inline_menu())
-        return
-
-    # Топ по кликам (all-time)
-    if data == "top_clicks":
-        rows = db_fetchall(
-            """
-            SELECT id, total_clicks
-            FROM users
-            ORDER BY total_clicks DESC
-            LIMIT 10
-            """
-        )
-        text = "🔥 Топ по кликам (all-time)\n\n"
-        if not rows:
-            text += "Пока пусто."
-        else:
-            for i, (uid, clicks) in enumerate(rows, start=1):
-                text += f"{i}) {uid} — {int(clicks)} кликов\n"
-        await q.edit_message_text(text, reply_markup=tops_inline_menu())
-        return
-
-    # Топ по балансу
-    if data == "top_balance":
-        rows = db_fetchall(
-            """
-            SELECT id, balance
-            FROM users
-            ORDER BY balance DESC
-            LIMIT 10
-            """
-        )
-        text = "💰 Топ по балансу\n\n"
-        if not rows:
-            text += "Пока пусто."
-        else:
-            for i, (uid, bal) in enumerate(rows, start=1):
-                text += f"{i}) {uid} — {round(float(bal), 2)} GOLD\n"
-        await q.edit_message_text(text, reply_markup=tops_inline_menu())
-        return
-
-    # Топ рефоводов
-    if data == "top_refs":
-        rows = db_fetchall(
-            """
-            SELECT r.referrer_id, COUNT(*) AS cnt
-            FROM referrals r
-            JOIN users u ON u.id = r.user_id
-            WHERE u.subscribed=1
-            GROUP BY r.referrer_id
-            ORDER BY cnt DESC
-            LIMIT 10
-            """
-        )
-        text = "👥 Топ рефоводов (подписанные)\n\n"
-        if not rows:
-            text += "Пока пусто."
-        else:
-            for i, (uid, cnt) in enumerate(rows, start=1):
-                text += f"{i}) {uid} — {int(cnt)} рефералов\n"
-        await q.edit_message_text(text, reply_markup=tops_inline_menu())
-        return
-
-    # Бонусы за рефералов
-    if data == "ref_rewards":
-        count = get_subscribed_refs_count(user_id)
-        msg = "🎯 Бонусы за рефералов\n\n"
-        msg += f"👥 Подписанных рефералов: {count}\n\n"
-        msg += "Выбери награду:\n"
-        await q.edit_message_text(msg, reply_markup=ref_rewards_inline_menu())
-        return
-
-    # Claim ref tier
-    if data.startswith("claim_ref_"):
-        try:
-            tier = int(data.split("_")[-1])
-        except Exception:
-            return
-
-        # есть такой tier?
-        reward = None
-        for t, r in REF_TIER_REWARDS:
-            if t == tier:
-                reward = r
-                break
-        if reward is None:
-            await q.edit_message_text("❌ Такой награды нет.", reply_markup=profile_inline_menu())
-            return
-
-        # уже забирал?
-        already = db_fetchone("SELECT 1 FROM ref_rewards_claimed WHERE user_id=%s AND tier=%s", (user_id, tier))
-        if already:
-            await q.edit_message_text("❌ Эта награда уже была получена.", reply_markup=ref_rewards_inline_menu())
-            return
-
-        # хватает рефов?
-        cnt = get_subscribed_refs_count(user_id)
-        if cnt < tier:
-            await q.edit_message_text(
-                f"❌ Недостаточно рефералов.\nНужно: {tier}\nУ тебя: {cnt}",
-                reply_markup=ref_rewards_inline_menu(),
-            )
-            return
-
-        # выдаём
-        db_exec("UPDATE users SET balance=balance+%s WHERE id=%s", (reward, user_id))
-        db_exec("INSERT INTO ref_rewards_claimed (user_id, tier) VALUES (%s,%s) ON CONFLICT DO NOTHING", (user_id, tier))
-
-        await q.edit_message_text(
-            f"✅ Награда получена!\n💰 +{reward} GOLD\n🎯 За {tier} рефералов",
-            reply_markup=ref_rewards_inline_menu(),
-        )
-        return
-
-async def send_profile(q, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
-    user_id = q.from_user.id
-    vip_type, vip_until_dt = check_and_update_vip(user_id)
-
-    row = db_fetchone("SELECT balance, clicks_used, clicks_limit, total_clicks FROM users WHERE id=%s", (user_id,))
-    bal, used, limit, total_clicks = row if row else (0, 0, DEFAULT_CLICKS_LIMIT, 0)
-
-    used, next_reset, limit = check_click_reset(user_id)
-
-    base = f"@{q.from_user.username}" if q.from_user.username else (q.from_user.first_name or "User")
-    icon = VIP_ICONS.get(vip_type, "") if vip_type else ""
-    nick = f"{base}{icon}"
-
-    vip_status_text = vip_type if vip_type else "нет"
-    vip_left_text = format_time_left(vip_until_dt - datetime.now()) if vip_until_dt else "нет VIP статуса"
-
-    text = (
-        f"👤 Профиль\n"
-        f"Ваш ник: {nick}\n"
-        f"VIP статус: {vip_status_text}\n"
-        f"Срок VIP статуса: {vip_left_text}\n\n"
-        f"💰 Баланс: {round(float(bal), 2)} GOLD\n"
-        f"📊 Клики (сейчас): {used}/{limit}\n"
-        f"🔥 Клики (all-time): {int(total_clicks)}\n"
-        f"⏳ До обновления: {format_time_left(next_reset - datetime.now())}"
-    )
-
-    if edit:
-        await q.edit_message_text(text, reply_markup=profile_inline_menu())
-    else:
-        await q.message.reply_text(text, reply_markup=profile_inline_menu())
 
 # =========================
 # ===== ОБРАБОТКА =========
@@ -726,12 +477,12 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     ensure_user(user_id)
-    check_and_update_vip(user_id)
+    vip_type, vip_until_dt = check_and_update_vip(user_id)
 
     # бан (кроме админа)
     if user_id != ADMIN_ID:
         r = db_fetchone("SELECT banned FROM users WHERE id=%s", (user_id,))
-        if r and int(r[0]) == 1:
+        if r and r[0] == 1:
             await safe_reply(update, "⛔ Вы заблокированы.")
             return
 
@@ -761,8 +512,13 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "👤 Профиль":
         vip_type, vip_until_dt = check_and_update_vip(user_id)
 
+        # ВАЖНО: total_clicks гарантированно существует (init_db добавляет),
+        # поэтому профиль больше не падает.
         row = db_fetchone("SELECT balance, clicks_used, clicks_limit, total_clicks FROM users WHERE id=%s", (user_id,))
-        bal, used, limit, total_clicks = row if row else (0, 0, DEFAULT_CLICKS_LIMIT, 0)
+        if row:
+            bal, used_now, limit_now, total_clicks = row
+        else:
+            bal, used_now, limit_now, total_clicks = (0, 0, DEFAULT_CLICKS_LIMIT, 0)
 
         used, next_reset, limit = check_click_reset(user_id)
 
@@ -772,17 +528,16 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await safe_reply(
             update,
-            f"👤 Профиль\n"
+            "👤 Профиль\n"
             f"Ваш ник: {nick}\n"
             f"VIP статус: {vip_status_text}\n"
             f"Срок VIP статуса: {vip_left_text}\n\n"
-            f"💰 Баланс: {round(float(bal), 2)} GOLD\n"
-            f"📊 Клики (сейчас): {used}/{limit}\n"
-            f"🔥 Клики (all-time): {int(total_clicks)}\n"
+            f"💰 Баланс: {round(bal, 2)} GOLD\n"
+            f"📊 Клики (за период): {used}/{limit}\n"
+            f"🏁 Клики (всего): {int(total_clicks)}\n"
             f"⏳ До обновления: {format_time_left(next_reset - datetime.now())}",
+            reply_markup=main_menu(user_id),
         )
-        # отдельным сообщением — инлайн меню
-        await update.message.reply_text("⚙️ Быстрые действия:", reply_markup=profile_inline_menu())
         return
 
     # ЗАРАБОТАТЬ
@@ -795,14 +550,16 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(update, "👆 Нажимай «КЛИК»", reply_markup=earn_menu())
         return
 
+    # КЛИК
     if text == "👆 КЛИК" and context.user_data.get("earning"):
         used, _, limit = check_click_reset(user_id)
         if used >= limit:
             await safe_reply(update, "❌ У вас закончились клики", reply_markup=main_menu(user_id))
             return
 
+        # +баланс, +клик за период, +клик общий
         db_exec(
-            "UPDATE users SET balance=balance+%s, clicks_used=clicks_used+1, total_clicks=total_clicks+1 WHERE id=%s",
+            "UPDATE users SET balance=balance+%s, clicks_used=clicks_used+1, total_clicks=COALESCE(total_clicks,0)+1 WHERE id=%s",
             (CLICK_REWARD, user_id),
         )
         used += 1
@@ -817,8 +574,8 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         for ref_id, rewarded in refs:
             row = db_fetchone("SELECT subscribed FROM users WHERE id=%s", (ref_id,))
-            sub = int(row[0]) if row else 0
-            if sub and int(rewarded) == 0:
+            sub = row[0] if row else 0
+            if sub and rewarded == 0:
                 db_exec("UPDATE users SET balance=balance+%s WHERE id=%s", (REF_REWARD, user_id))
                 db_exec("UPDATE referrals SET rewarded=1 WHERE user_id=%s", (ref_id,))
                 earned += REF_REWARD
@@ -829,7 +586,7 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👥 Ваша ссылка:\n{link}\n"
             f"💰 За подписанного: {REF_REWARD} GOLD\n"
             f"👥 Всего: {total}\n"
-            f"💵 Начислено сейчас: {earned} GOLD",
+            f"💵 Получено: {earned} GOLD",
             reply_markup=main_menu(user_id),
         )
         return
@@ -849,7 +606,7 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             used_row = db_fetchone("SELECT 1 FROM used_promocodes WHERE user_id=%s AND code=%s", (user_id, text))
             if used_row:
                 await safe_reply(update, "❌ Уже использован", reply_markup=main_menu(user_id))
-            elif int(uses_left) <= 0:
+            elif uses_left <= 0:
                 await safe_reply(update, "❌ Промокод недействителен", reply_markup=main_menu(user_id))
             else:
                 db_exec("UPDATE users SET balance=balance+%s WHERE id=%s", (amount, user_id))
@@ -865,7 +622,7 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ВЫВОД
     if text == "💸 Вывод":
         row = db_fetchone("SELECT balance FROM users WHERE id=%s", (user_id,))
-        bal = float(row[0]) if row else 0.0
+        bal = row[0] if row else 0
         if bal < MIN_WITHDRAW:
             await safe_reply(update, f"❌ Минимум {MIN_WITHDRAW} GOLD", reply_markup=main_menu(user_id))
             return
@@ -886,7 +643,7 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             amount = float(text)
             row = db_fetchone("SELECT balance FROM users WHERE id=%s", (user_id,))
-            bal = float(row[0]) if row else 0.0
+            bal = row[0] if row else 0
 
             if amount < MIN_WITHDRAW or amount > bal:
                 await safe_reply(update, "❌ Неверная сумма", reply_markup=cancel_menu())
@@ -911,11 +668,11 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await safe_reply(
             update,
-            f"✅ Заявка отправлена!\n"
+            "✅ Заявка отправлена!\n"
             f"💰 {amount} GOLD\n"
             f"✍️ {requisites}\n"
             f"🕒 {now_human()}\n\n"
-            f"⏳ Регламент вывода: в течение 24 часов. Ожидайте ✅",
+            "⏳ Регламент вывода: в течение 24 часов. Ожидайте ✅",
             reply_markup=main_menu(user_id),
         )
         context.user_data.clear()
@@ -1049,7 +806,7 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 uid = int(parts[0])
                 ensure_user(uid)
                 row = db_fetchone("SELECT banned FROM users WHERE id=%s", (uid,))
-                banned = int(row[0]) if row else 0
+                banned = row[0] if row else 0
                 new_status = 0 if banned else 1
                 db_exec("UPDATE users SET banned=%s WHERE id=%s", (new_status, uid))
                 await safe_reply(update, f"✅ Пользователь {uid} {'разбанен' if banned else 'забанен'}", reply_markup=admin_menu())
@@ -1083,7 +840,7 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 ensure_user(uid)
                 row = db_fetchone("SELECT clicks_limit FROM users WHERE id=%s", (uid,))
-                current_limit = int(row[0]) if row else DEFAULT_CLICKS_LIMIT
+                current_limit = row[0] if row else DEFAULT_CLICKS_LIMIT
 
                 until = datetime.now() + dur
                 new_limit = VIP_LIMITS[vip]
@@ -1129,7 +886,7 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
     if isinstance(err, Conflict):
-        logger.warning("Conflict: похоже запущено 2 экземпляра бота (getUpdates). Оставь один.")
+        logger.warning("Conflict: запущено 2 getUpdates. Бот может молчать, пока конфликт не исчезнет.")
         return
     logger.exception("Unhandled error:", exc_info=err)
 
@@ -1138,18 +895,20 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 def main():
     if not TOKEN:
-        raise RuntimeError("TOKEN не найден. Добавь Railway Variables -> TOKEN")
+        raise RuntimeError("TOKEN не найден. Railway -> Variables -> TOKEN")
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL не найден. Railway -> Variables -> DATABASE_URL")
 
     db_connect()
     init_db()
 
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(inline_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handler))
     app.add_error_handler(error_handler)
 
     print("✅ Бот запущен")
+    # Если конфликт getUpdates — Telegram вернёт 409, но код не упадёт из-за БД
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
