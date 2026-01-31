@@ -13,6 +13,7 @@ from telegram import (
     InlineKeyboardButton,
 )
 from telegram.error import TimedOut, Conflict
+from telegram.helpers import mention_html
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -34,7 +35,7 @@ CLICK_REWARD = 1
 MIN_WITHDRAW = 1000
 
 DEFAULT_CLICKS_LIMIT = 1500
-CLICK_RESET_HOURS = 3  # ✅ было 12 -> стало 3
+CLICK_RESET_HOURS = 3
 REF_REWARD = 150
 
 DAILY_BONUS_AMOUNT = 500
@@ -65,7 +66,7 @@ conn = None
 
 
 def _parse_db_url(db_url: str) -> dict:
-    """Парсим postgres://... и подключаемся через kwargs (надёжнее, чем DSN строкой)."""
+    """Парсим postgres://... и подключаемся через kwargs."""
     from urllib.parse import urlparse, unquote
 
     u = urlparse(db_url)
@@ -244,10 +245,18 @@ def init_db():
     )
 
 
+def cleanup_bad_usernames():
+    # Если когда-то в username попали цифры (tg id) — очищаем, чтобы дальше в ТОПах был кликабельный ID
+    db_exec("UPDATE users SET username=NULL WHERE username ~ '^[0-9]+$'")
+
+
 def ensure_user(user_id: int, username: Optional[str] = None):
     db_exec("INSERT INTO users (id) VALUES (%s) ON CONFLICT (id) DO NOTHING", (user_id,))
     if username:
-        db_exec("UPDATE users SET username=%s WHERE id=%s", (username, user_id))
+        u = username.strip().lstrip("@")
+        # сохраняем только реальный username, не цифры
+        if u and not u.isdigit():
+            db_exec("UPDATE users SET username=%s WHERE id=%s", (u, user_id))
 
 
 # =========================
@@ -312,17 +321,16 @@ def tops_inline_menu():
 
 def ref_bonuses_inline_menu(user_id: int, ref_count: int, claimed10: int, claimed50: int, claimed100: int):
     buttons = []
-    # 10
     if claimed10:
         buttons.append([InlineKeyboardButton("✅ 10 рефов — получено", callback_data="noop")])
     else:
         buttons.append([InlineKeyboardButton("🎁 Забрать за 10 рефов", callback_data="claim_ref_10")])
-    # 50
+
     if claimed50:
         buttons.append([InlineKeyboardButton("✅ 50 рефов — получено", callback_data="noop")])
     else:
         buttons.append([InlineKeyboardButton("🎁 Забрать за 50 рефов", callback_data="claim_ref_50")])
-    # 100
+
     if claimed100:
         buttons.append([InlineKeyboardButton("✅ 100 рефов — получено", callback_data="noop")])
     else:
@@ -448,18 +456,16 @@ def get_display_nick(user_id: int, tg_username: Optional[str], vip_type: Optiona
     return f"{base}{icon}"
 
 
-# ✅ НОВОЕ: красивое имя для ТОПов с кликом по профилю (HTML)
-def _safe_name_for_top_html(username: Optional[str], user_id: int) -> str:
-    """
-    Возвращает HTML-строку:
-    - если есть username -> кликабельный @username
-    - если нет username -> кликабельный ID через tg://user?id=...
-    """
+def name_for_top_html(username: Optional[str], user_id: int) -> str:
+    # username -> кликабельный @username
     if username:
-        u = html_escape(username)
-        return f'<a href="https://t.me/{u}">@{u}</a>'
-    uid = str(user_id)
-    return f'<a href="tg://user?id={uid}">{uid}</a>'
+        u = username.strip().lstrip("@")
+        if u and not u.isdigit():
+            safe_u = html_escape(u)
+            return f'<a href="https://t.me/{safe_u}">@{safe_u}</a>'
+
+    # иначе -> кликабельный ID (tg://user?id=...)
+    return mention_html(user_id, str(user_id))
 
 
 def get_subscribed_ref_count(referrer_id: int) -> int:
@@ -542,21 +548,17 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = q.data or ""
 
-    # BACK to profile
     if data == "back_profile":
         await send_profile(q, context, user_id)
         return
 
-    # no-op
     if data == "noop":
         return
 
-    # open tops menu
     if data == "tops":
         await q.message.reply_text("🏆 Выберите ТОП:", reply_markup=tops_inline_menu())
         return
 
-    # daily bonus
     if data == "daily_bonus":
         row = db_fetchone("SELECT last_daily_bonus FROM users WHERE id=%s", (user_id,))
         last_daily = row[0] if row else None
@@ -569,7 +571,10 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        db_exec("UPDATE users SET balance=balance+%s, last_daily_bonus=%s WHERE id=%s", (DAILY_BONUS_AMOUNT, now_iso(), user_id))
+        db_exec(
+            "UPDATE users SET balance=balance+%s, last_daily_bonus=%s WHERE id=%s",
+            (DAILY_BONUS_AMOUNT, now_iso(), user_id),
+        )
         await q.message.reply_text(f"✅ Ежедневный бонус получен: +{DAILY_BONUS_AMOUNT} GOLD 🎁")
         return
 
@@ -583,8 +588,7 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += "Пока пусто."
         else:
             for i, (uid, uname, tc) in enumerate(rows, start=1):
-                name_html = _safe_name_for_top_html(uname, uid)
-                msg += f"{i}) {name_html} — {int(tc)} кликов\n"
+                msg += f"{i}) {name_for_top_html(uname, uid)} — {int(tc)} кликов\n"
 
         await q.message.reply_text(
             msg,
@@ -604,8 +608,7 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += "Пока пусто."
         else:
             for i, (uid, uname, bal) in enumerate(rows, start=1):
-                name_html = _safe_name_for_top_html(uname, uid)
-                msg += f"{i}) {name_html} — {round(float(bal), 2)} GOLD\n"
+                msg += f"{i}) {name_for_top_html(uname, uid)} — {round(float(bal), 2)} GOLD\n"
 
         await q.message.reply_text(
             msg,
@@ -634,8 +637,7 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += "Пока пусто."
         else:
             for i, (ref_uid, ref_uname, c) in enumerate(rows, start=1):
-                name_html = _safe_name_for_top_html(ref_uname, ref_uid)
-                msg += f"{i}) {name_html} — {int(c)} рефералов\n"
+                msg += f"{i}) {name_for_top_html(ref_uname, ref_uid)} — {int(c)} рефералов\n"
 
         await q.message.reply_text(
             msg,
@@ -645,12 +647,10 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # open ref bonuses menu
     if data == "ref_bonuses":
         await send_ref_bonus_menu(q, context, user_id)
         return
 
-    # claim ref bonus
     if data.startswith("claim_ref_"):
         await process_claim_ref_bonus(q, context, user_id, data)
         return
@@ -714,7 +714,6 @@ async def send_ref_bonus_menu(q, context, user_id: int):
 async def process_claim_ref_bonus(q, context, user_id: int, data: str):
     ref_count = get_subscribed_ref_count(user_id)
 
-    # какая награда
     if data == "claim_ref_10":
         need, reward, col = 10, 1000, "ref_bonus_10"
     elif data == "claim_ref_50":
@@ -736,7 +735,6 @@ async def process_claim_ref_bonus(q, context, user_id: int, data: str):
 
     db_exec(f"UPDATE users SET balance=balance+%s, {col}=1 WHERE id=%s", (reward, user_id))
     await q.message.reply_text(f"🎉 Награда получена: +{reward} GOLD ✅")
-    # обновим меню
     await send_ref_bonus_menu(q, context, user_id)
 
 
@@ -863,7 +861,6 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ПРОФИЛЬ
     if text == "👤 Профиль":
         await safe_reply(update, "Открываю профиль 👇", reply_markup=main_menu(user_id))
-        # отдельным сообщением с инлайном (чтобы красиво работало)
         fake_q = type("Q", (), {})()
         fake_q.message = update.message
         fake_q.from_user = update.effective_user
@@ -1237,6 +1234,7 @@ def main():
 
     db_connect()
     init_db()
+    cleanup_bad_usernames()  # ✅ авто-чинит кривые username=цифры
 
     app = ApplicationBuilder().token(TOKEN).build()
 
