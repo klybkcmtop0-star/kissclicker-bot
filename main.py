@@ -3,6 +3,7 @@ import logging
 import time
 from datetime import datetime, timedelta
 from typing import Optional
+from html import escape as html_escape
 
 import psycopg2
 from telegram import (
@@ -447,10 +448,18 @@ def get_display_nick(user_id: int, tg_username: Optional[str], vip_type: Optiona
     return f"{base}{icon}"
 
 
-def _safe_name_for_top(username: Optional[str], user_id: int) -> str:
+# ✅ НОВОЕ: красивое имя для ТОПов с кликом по профилю (HTML)
+def _safe_name_for_top_html(username: Optional[str], user_id: int) -> str:
+    """
+    Возвращает HTML-строку:
+    - если есть username -> кликабельный @username
+    - если нет username -> кликабельный ID через tg://user?id=...
+    """
     if username:
-        return f"@{username}"
-    return str(user_id)
+        u = html_escape(username)
+        return f'<a href="https://t.me/{u}">@{u}</a>'
+    uid = str(user_id)
+    return f'<a href="tg://user?id={uid}">{uid}</a>'
 
 
 def get_subscribed_ref_count(referrer_id: int) -> int:
@@ -574,8 +583,15 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += "Пока пусто."
         else:
             for i, (uid, uname, tc) in enumerate(rows, start=1):
-                msg += f"{i}) {_safe_name_for_top(uname, uid)} — {int(tc)} кликов\n"
-        await q.message.reply_text(msg, reply_markup=tops_inline_menu())
+                name_html = _safe_name_for_top_html(uname, uid)
+                msg += f"{i}) {name_html} — {int(tc)} кликов\n"
+
+        await q.message.reply_text(
+            msg,
+            reply_markup=tops_inline_menu(),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
         return
 
     # top balance
@@ -588,8 +604,15 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += "Пока пусто."
         else:
             for i, (uid, uname, bal) in enumerate(rows, start=1):
-                msg += f"{i}) {_safe_name_for_top(uname, uid)} — {round(float(bal), 2)} GOLD\n"
-        await q.message.reply_text(msg, reply_markup=tops_inline_menu())
+                name_html = _safe_name_for_top_html(uname, uid)
+                msg += f"{i}) {name_html} — {round(float(bal), 2)} GOLD\n"
+
+        await q.message.reply_text(
+            msg,
+            reply_markup=tops_inline_menu(),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
         return
 
     # top refs
@@ -611,8 +634,15 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += "Пока пусто."
         else:
             for i, (ref_uid, ref_uname, c) in enumerate(rows, start=1):
-                msg += f"{i}) {_safe_name_for_top(ref_uname, ref_uid)} — {int(c)} рефералов\n"
-        await q.message.reply_text(msg, reply_markup=tops_inline_menu())
+                name_html = _safe_name_for_top_html(ref_uname, ref_uid)
+                msg += f"{i}) {name_html} — {int(c)} рефералов\n"
+
+        await q.message.reply_text(
+            msg,
+            reply_markup=tops_inline_menu(),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
         return
 
     # open ref bonuses menu
@@ -1221,4 +1251,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
