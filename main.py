@@ -1,9 +1,8 @@
 import os
 import logging
 import time
-import asyncio
 from datetime import datetime, timedelta
-from typing import Optional, Tuple, Any
+from typing import Optional, Tuple, List
 
 import psycopg2
 from telegram import (
@@ -12,7 +11,6 @@ from telegram import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
-from telegram.constants import ParseMode
 from telegram.error import TimedOut, Conflict
 from telegram.ext import (
     ApplicationBuilder,
@@ -32,57 +30,68 @@ ADMIN_ID = 1924971257
 CHANNEL_ID = "@kisspromochannel"
 
 CLICK_REWARD = 1
-MIN_WITHDRAW = 2000
+MIN_WITHDRAW = 1000
 
-DEFAULT_CLICKS_LIMIT = 2000
+DEFAULT_CLICKS_LIMIT = 2000  # ✅ было 1500 -> стало 2000
 CLICK_RESET_HOURS = 3
-REF_REWARD = 250
+REF_REWARD = 150
 
 DAILY_BONUS_AMOUNT = 500
 DAILY_BONUS_HOURS = 24
 
 VIP_LIMITS = {"VIP": 2500, "MVP": 3000, "PREMIUM": 4000}
 VIP_ICONS = {"VIP": "🏆", "MVP": "💎", "PREMIUM": "💲"}
-VIP_RANK = {"VIP": 1, "MVP": 2, "PREMIUM": 3}
+VIP_FRAMES = {"VIP": "💎", "MVP": "🏆", "PREMIUM": "🔥"}  # ✅ рамка всегда главнее
+
+COSMETIC_COOLDOWN_SECONDS = 10
 
 # =========================
-# ===== КЕЙСЫ =============
+# ===== КОСМЕТИКА =========
 # =========================
-CASE_RESET_HOURS = 12
-CASE_LIMITS = {"common": 7, "rare": 4, "legend": 2}  # как ты утвердил
-CASE_PRICES = {"common": 500, "rare": 1000, "legend": 3000}
-CASE_ANIM_SECONDS = {"common": 7, "rare": 8, "legend": 10}  # интрига 7–10 сек
+# Титулы (код -> отображение)
+TITLE_DISPLAY = {
+    "ROOKIE": "Rookie",
+    "LEGEND": "Legend",
+    "MASTER": "Master",
+    "BETA_TESTER": "Beta Tester",
+    "OLD": "Old",
+    "ADMIN": "Admin",
+    "MODER": "Moder",
+    "GRAND_MASTER": "Grand Master",
+    "RICH": "Rich",
+    "ELITE": "Elite",
+    "KING": "KING",
+    "ETERNITY": "Eternity",
+    "STINGER": "Stinger",
+    "DEV": "DEV",
+    "OWNER": "OWNER",
 
-# ВЕСА (не проценты). Экономика: основной шанс — минус/почти минус, как ты хотел.
-# ("gold", amount, weight) или ("vip", (VIPTYPE, days), weight)
-CASE_WEIGHTS = {
-    "common": [
-        ("gold", 100, 60),
-        ("gold", 250, 30),
-        ("gold", 700, 12),
-        ("gold", 1000, 6),
-        ("vip", ("VIP", 1), 3),
-        ("vip", ("MVP", 1), 2),
-        ("gold", 2000, 1),
-    ],
-    "rare": [
-        ("gold", 400, 70),
-        ("gold", 700, 40),
-        ("gold", 1400, 15),
-        ("gold", 1700, 8),
-        ("vip", ("MVP", 3), 4),
-        ("vip", ("PREMIUM", 1), 2),
-        ("gold", 4000, 1),
-    ],
-    "legend": [
-        ("gold", 1000, 70),
-        ("gold", 1500, 40),
-        ("gold", 3300, 15),
-        ("gold", 3900, 8),
-        ("vip", ("MVP", 5), 5),
-        ("vip", ("PREMIUM", 3), 4),
-        ("gold", 6500, 2),
-    ],
+    # прогресс-титулы
+    "MASTER_CLICK": "Master Click",
+    "ELITE_CLICKER": "Elite Clicker",
+    "ULTRA_CLICKER": "Ultra Clicker",
+    "IMPOSSIBLE_CLICKER": "Impossible Clicker",
+}
+
+# Пороги прогресс-титулов: (клики, code)
+PROGRESS_TITLES = [
+    (0, "ROOKIE"),
+    (5000, "MASTER_CLICK"),
+    (8000, "ELITE_CLICKER"),
+    (13000, "ULTRA_CLICKER"),
+    (20000, "IMPOSSIBLE_CLICKER"),
+]
+
+# Фоны (код -> (emoji, display, price))
+THEMES = {
+    # цены твои:
+    "FIRE": ("🔥", "Огненный", 1200),
+    "DARK": ("🌑", "Тёмный", 1700),
+    "CRYSTAL": ("💎", "Кристальный", 2300),
+    "ICE": ("❄️", "Ледяной", 2300),
+    "NEWYEAR": ("🎄", "Новогодний", 2700),
+    "CHOC": ("🍫", "Шоколадный", 3000),
+    "TOP": ("⭐️", "Топовый", 4000),
 }
 
 # =========================
@@ -166,6 +175,7 @@ def db_fetchall(query: str, params: tuple = ()):
 
 
 def init_db():
+    # users
     db_exec(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -180,6 +190,7 @@ def init_db():
         """
     )
 
+    # referrals
     db_exec(
         """
         CREATE TABLE IF NOT EXISTS referrals (
@@ -190,6 +201,7 @@ def init_db():
         """
     )
 
+    # withdrawals
     db_exec(
         """
         CREATE TABLE IF NOT EXISTS withdrawals (
@@ -202,6 +214,7 @@ def init_db():
         """
     )
 
+    # promocodes
     db_exec(
         """
         CREATE TABLE IF NOT EXISTS promocodes (
@@ -212,6 +225,7 @@ def init_db():
         """
     )
 
+    # used promocodes
     db_exec(
         """
         CREATE TABLE IF NOT EXISTS used_promocodes (
@@ -222,7 +236,30 @@ def init_db():
         """
     )
 
-    # ---- миграции / расширения
+    # cosmetics inventory
+    db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS titles_owned (
+            user_id BIGINT,
+            code TEXT,
+            expires_at TEXT DEFAULT NULL,
+            PRIMARY KEY(user_id, code)
+        )
+        """
+    )
+
+    db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS themes_owned (
+            user_id BIGINT,
+            code TEXT,
+            expires_at TEXT DEFAULT NULL,
+            PRIMARY KEY(user_id, code)
+        )
+        """
+    )
+
+    # ---- миграции: добавляем колонки, НЕ ТРОГАЕМ старые данные
     db_exec(
         """
         DO $$
@@ -255,7 +292,7 @@ def init_db():
                 THEN ALTER TABLE users ADD COLUMN last_daily_bonus TEXT DEFAULT NULL;
             END IF;
 
-            -- ref bonus flags
+            -- ref bonuses flags
             IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='ref_bonus_10')
                 THEN ALTER TABLE users ADD COLUMN ref_bonus_10 INTEGER DEFAULT 0;
             END IF;
@@ -270,38 +307,22 @@ def init_db():
             IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='withdrawals' AND column_name='admin_note')
                 THEN ALTER TABLE withdrawals ADD COLUMN admin_note TEXT DEFAULT NULL;
             END IF;
+
             IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='withdrawals' AND column_name='decided_at')
                 THEN ALTER TABLE withdrawals ADD COLUMN decided_at TEXT DEFAULT NULL;
             END IF;
 
-            -- ===== CASES =====
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='case_common')
-                THEN ALTER TABLE users ADD COLUMN case_common INTEGER DEFAULT 0;
-            END IF;
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='case_rare')
-                THEN ALTER TABLE users ADD COLUMN case_rare INTEGER DEFAULT 0;
-            END IF;
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='case_legend')
-                THEN ALTER TABLE users ADD COLUMN case_legend INTEGER DEFAULT 0;
+            -- cosmetics: active selections + cooldown
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='active_title')
+                THEN ALTER TABLE users ADD COLUMN active_title TEXT DEFAULT 'ROOKIE';
             END IF;
 
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='case_opened_common')
-                THEN ALTER TABLE users ADD COLUMN case_opened_common INTEGER DEFAULT 0;
-            END IF;
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='case_opened_rare')
-                THEN ALTER TABLE users ADD COLUMN case_opened_rare INTEGER DEFAULT 0;
-            END IF;
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='case_opened_legend')
-                THEN ALTER TABLE users ADD COLUMN case_opened_legend INTEGER DEFAULT 0;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='active_theme')
+                THEN ALTER TABLE users ADD COLUMN active_theme TEXT DEFAULT NULL;
             END IF;
 
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='case_reset_at')
-                THEN ALTER TABLE users ADD COLUMN case_reset_at TEXT DEFAULT NULL;
-            END IF;
-
-            -- защита от спама открытия кейсов (сервак рестартнулся — всё равно защищает)
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='opening_case')
-                THEN ALTER TABLE users ADD COLUMN opening_case INTEGER DEFAULT 0;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='last_cosmetic_change')
+                THEN ALTER TABLE users ADD COLUMN last_cosmetic_change TEXT DEFAULT NULL;
             END IF;
         END $$;
         """
@@ -338,6 +359,7 @@ def admin_menu():
             ["Создать промокод", "Выдать баланс"],
             ["Забрать баланс", "Бан/Разбан"],
             ["⚙ Выдать лимит кликов", "🎖 Выдать привилегию"],
+            ["🏷 Выдать титул", "🌌 Выдать фон"],
             ["Рассылка", "📋 Заявки на вывод"],
             ["Все промокоды", "🔙 Назад"],
         ],
@@ -359,7 +381,7 @@ def profile_inline_menu():
             [InlineKeyboardButton("🎁 Ежедневный бонус", callback_data="daily_bonus")],
             [InlineKeyboardButton("🏆 ТОПЫ", callback_data="tops")],
             [InlineKeyboardButton("🎯 Бонусы за рефералов", callback_data="ref_bonuses")],
-            [InlineKeyboardButton("📦 Кейсы", callback_data="cases")],
+            [InlineKeyboardButton("🎨 Косметика", callback_data="cosmetics")],
         ]
     )
 
@@ -375,7 +397,22 @@ def tops_inline_menu():
     )
 
 
-def ref_bonuses_inline_menu(claimed10: int, claimed50: int, claimed100: int):
+def cosmetics_inline_menu():
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🏷 Титул", callback_data="cos_title")],
+            [InlineKeyboardButton("🌌 Фон", callback_data="cos_theme")],
+            [InlineKeyboardButton("🛒 Магазин фонов", callback_data="cos_shop")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back_profile")],
+        ]
+    )
+
+
+def back_to_cosmetics_menu():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="cosmetics")]])
+
+
+def ref_bonuses_inline_menu(user_id: int, ref_count: int, claimed10: int, claimed50: int, claimed100: int):
     buttons = []
     if claimed10:
         buttons.append([InlineKeyboardButton("✅ 10 рефов — получено", callback_data="noop")])
@@ -396,66 +433,9 @@ def ref_bonuses_inline_menu(claimed10: int, claimed50: int, claimed100: int):
     return InlineKeyboardMarkup(buttons)
 
 
-def cases_inline_menu(common: int, rare: int, legend: int):
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton(f"📦 Обычный (x{common}) — Открыть", callback_data="open_case_common")],
-            [InlineKeyboardButton(f"🎁 Редкий (x{rare}) — Открыть", callback_data="open_case_rare")],
-            [InlineKeyboardButton(f"💎 Легендарный (x{legend}) — Открыть", callback_data="open_case_legend")],
-            [InlineKeyboardButton("🛒 Магазин кейсов", callback_data="case_shop")],
-            [InlineKeyboardButton("ℹ️ Что может выпасть?", callback_data="case_drops")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="back_profile")],
-        ]
-    )
-
-
-def case_shop_menu():
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("📦 Купить Обычный", callback_data="buy_case_common")],
-            [InlineKeyboardButton("🎁 Купить Редкий", callback_data="buy_case_rare")],
-            [InlineKeyboardButton("💎 Купить Легендарный", callback_data="buy_case_legend")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="cases")],
-        ]
-    )
-
-
-def case_drops_menu():
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("📦 Обычный — дроп", callback_data="drops_common")],
-            [InlineKeyboardButton("🎁 Редкий — дроп", callback_data="drops_rare")],
-            [InlineKeyboardButton("💎 Легендарный — дроп", callback_data="drops_legend")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="cases")],
-        ]
-    )
-
-
 # =========================
 # ===== ВСПОМОГАТЕЛЬНОЕ ===
 # =========================
-async def safe_reply(update: Update, text: str, reply_markup=None, parse_mode: Optional[str] = None):
-    try:
-        if update.message:
-            return await update.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
-    except TimedOut:
-        try:
-            if update.message:
-                return await update.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
-        except Exception as e:
-            logger.warning(f"safe_reply second try failed: {e}")
-    except Exception as e:
-        logger.warning(f"safe_reply failed: {e}")
-
-
-async def is_subscribed(bot, user_id: int):
-    try:
-        member = await bot.get_chat_member(CHANNEL_ID, user_id)
-        return member.status in ["member", "administrator", "creator"]
-    except Exception:
-        return False
-
-
 def now_iso():
     return datetime.now().isoformat(timespec="seconds")
 
@@ -476,6 +456,42 @@ def format_time_left(td: timedelta):
     if hours > 0:
         return f"{hours}ч {minutes}м"
     return f"{minutes}м"
+
+
+async def safe_send_message(message, text: str, reply_markup=None, parse_mode: Optional[str] = None, disable_preview: bool = True):
+    try:
+        return await message.reply_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+            disable_web_page_preview=disable_preview,
+        )
+    except TimedOut:
+        try:
+            return await message.reply_text(
+                text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+                disable_web_page_preview=disable_preview,
+            )
+        except Exception as e:
+            logger.warning(f"safe_send_message second try failed: {e}")
+    except Exception as e:
+        logger.warning(f"safe_send_message failed: {e}")
+
+
+async def safe_reply(update: Update, text: str, reply_markup=None, parse_mode: Optional[str] = None, disable_preview: bool = True):
+    if not update.message:
+        return
+    return await safe_send_message(update.message, text, reply_markup=reply_markup, parse_mode=parse_mode, disable_preview=disable_preview)
+
+
+async def is_subscribed(bot, user_id: int):
+    try:
+        member = await bot.get_chat_member(CHANNEL_ID, user_id)
+        return member.status in ["member", "administrator", "creator"]
+    except Exception:
+        return False
 
 
 def check_click_reset(user_id: int):
@@ -505,13 +521,84 @@ def check_click_reset(user_id: int):
 def parse_duration(value: str, unit: str):
     v = int(value)
     u = unit.lower()
+
+    # нормализуем рус/сокращения
+    if u in ("м", "мин", "минута", "минуты", "минут", "минутка"):
+        return timedelta(minutes=v)
+    if u in ("ч", "час", "часа", "часов"):
+        return timedelta(hours=v)
+    if u in ("д", "дн", "день", "дня", "дней"):
+        return timedelta(days=v)
+
+    # старые проверки
     if u.startswith("мин"):
         return timedelta(minutes=v)
     if u.startswith("час"):
         return timedelta(hours=v)
-    if u.startswith("дн"):
+    if u.startswith("дн") or u.startswith("ден") or u.startswith("дня"):
         return timedelta(days=v)
+
     return None
+
+
+def parse_duration_token(token: str) -> Optional[timedelta]:
+    """
+    Поддержка: 300м / 12ч / 2д
+    """
+    t = token.strip().lower()
+    if not t:
+        return None
+
+    # Infinity обрабатываем отдельно
+    if t in ("infinity", "inf", "∞", "♾️", "♾"):
+        return None
+
+    # короткий формат
+    if t[-1] in ("м", "ч", "д"):
+        num = t[:-1]
+        if not num.isdigit():
+            return None
+        v = int(num)
+        if t[-1] == "м":
+            return timedelta(minutes=v)
+        if t[-1] == "ч":
+            return timedelta(hours=v)
+        if t[-1] == "д":
+            return timedelta(days=v)
+
+    return None
+
+
+def parse_admin_time(parts: List[str], start_index: int) -> Tuple[bool, Optional[timedelta], str]:
+    """
+    Возвращает (is_infinity, duration, shown)
+    Поддержка:
+      - Infinity
+      - 300м/12ч/2д
+      - 300 минут / 1 час / 2 дня
+    """
+    if len(parts) <= start_index:
+        return False, None, ""
+
+    tok = parts[start_index].strip()
+    if tok.lower() in ("infinity", "inf", "∞", "♾️", "♾"):
+        return True, None, "Infinity"
+
+    # коротко: 12ч/300м/2д
+    d = parse_duration_token(tok)
+    if d is not None:
+        return False, d, tok
+
+    # полно: value unit
+    if len(parts) > start_index + 1:
+        v = parts[start_index]
+        u = parts[start_index + 1]
+        if v.isdigit():
+            d2 = parse_duration(v, u)
+            if d2:
+                return False, d2, f"{v} {u}"
+
+    return False, None, ""
 
 
 def check_and_update_vip(user_id: int):
@@ -541,21 +628,154 @@ def check_and_update_vip(user_id: int):
     return vip_type, until_dt
 
 
-def get_display_nick(user_id: int, tg_username: Optional[str], vip_type: Optional[str]):
-    base = f"@{tg_username}" if tg_username else str(user_id)
-    icon = VIP_ICONS.get(vip_type, "") if vip_type else ""
-    return f"{base}{icon}"
+def title_name(code: Optional[str]) -> str:
+    if not code:
+        return TITLE_DISPLAY.get("ROOKIE", "Rookie")
+    return TITLE_DISPLAY.get(code, code)
 
 
-def _html_escape(s: str) -> str:
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+def cleanup_expired_cosmetics(user_id: int):
+    # titles
+    rows = db_fetchall("SELECT code, expires_at FROM titles_owned WHERE user_id=%s", (user_id,))
+    now = datetime.now()
+    for code, exp in rows:
+        if exp:
+            try:
+                dt = datetime.fromisoformat(exp)
+                if now >= dt:
+                    db_exec("DELETE FROM titles_owned WHERE user_id=%s AND code=%s", (user_id, code))
+            except Exception:
+                pass
+
+    # themes
+    rows = db_fetchall("SELECT code, expires_at FROM themes_owned WHERE user_id=%s", (user_id,))
+    for code, exp in rows:
+        if exp:
+            try:
+                dt = datetime.fromisoformat(exp)
+                if now >= dt:
+                    db_exec("DELETE FROM themes_owned WHERE user_id=%s AND code=%s", (user_id, code))
+            except Exception:
+                pass
 
 
-def safe_name_for_top_html(username: Optional[str], user_id: int) -> str:
-    # Если есть юзернейм — @username, если нет — кликабельный ID
+def user_has_title(user_id: int, code: str) -> bool:
+    if code == "ROOKIE":
+        return True
+    row = db_fetchone("SELECT 1 FROM titles_owned WHERE user_id=%s AND code=%s", (user_id, code))
+    return bool(row)
+
+
+def user_has_theme(user_id: int, code: str) -> bool:
+    row = db_fetchone("SELECT 1 FROM themes_owned WHERE user_id=%s AND code=%s", (user_id, code))
+    return bool(row)
+
+
+def grant_title(user_id: int, code: str, expires_at: Optional[str] = None):
+    if code == "ROOKIE":
+        return
+    db_exec(
+        """
+        INSERT INTO titles_owned (user_id, code, expires_at)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (user_id, code) DO UPDATE SET expires_at=EXCLUDED.expires_at
+        """,
+        (user_id, code, expires_at),
+    )
+
+
+def grant_theme(user_id: int, code: str, expires_at: Optional[str] = None):
+    db_exec(
+        """
+        INSERT INTO themes_owned (user_id, code, expires_at)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (user_id, code) DO UPDATE SET expires_at=EXCLUDED.expires_at
+        """,
+        (user_id, code, expires_at),
+    )
+
+
+def grant_progress_titles(user_id: int, total_clicks: int) -> List[str]:
+    """
+    Выдаёт прогресс-титулы автоматически. Возвращает список НОВЫХ выданных кодов (кроме ROOKIE).
+    """
+    newly = []
+    for threshold, code in PROGRESS_TITLES:
+        if total_clicks >= threshold and code != "ROOKIE":
+            if not user_has_title(user_id, code):
+                grant_title(user_id, code, expires_at=None)
+                newly.append(code)
+    # убедимся, что active_title не пустой
+    row = db_fetchone("SELECT active_title FROM users WHERE id=%s", (user_id,))
+    if row and not row[0]:
+        db_exec("UPDATE users SET active_title='ROOKIE' WHERE id=%s", (user_id,))
+    return newly
+
+
+def get_effective_active_title(user_id: int) -> str:
+    cleanup_expired_cosmetics(user_id)
+    row = db_fetchone("SELECT active_title FROM users WHERE id=%s", (user_id,))
+    active = row[0] if row and row[0] else "ROOKIE"
+    if active != "ROOKIE" and not user_has_title(user_id, active):
+        active = "ROOKIE"
+        db_exec("UPDATE users SET active_title=%s WHERE id=%s", (active, user_id))
+    return active
+
+
+def get_effective_active_theme(user_id: int) -> Optional[str]:
+    cleanup_expired_cosmetics(user_id)
+    row = db_fetchone("SELECT active_theme FROM users WHERE id=%s", (user_id,))
+    active = row[0] if row else None
+    if active and not user_has_theme(user_id, active):
+        active = None
+        db_exec("UPDATE users SET active_theme=NULL WHERE id=%s", (user_id,))
+    return active
+
+
+def can_change_cosmetic(user_id: int) -> Tuple[bool, int]:
+    row = db_fetchone("SELECT last_cosmetic_change FROM users WHERE id=%s", (user_id,))
+    if not row or not row[0]:
+        return True, 0
+    try:
+        last = datetime.fromisoformat(row[0])
+    except Exception:
+        return True, 0
+    now = datetime.now()
+    diff = (now - last).total_seconds()
+    if diff >= COSMETIC_COOLDOWN_SECONDS:
+        return True, 0
+    return False, int(COSMETIC_COOLDOWN_SECONDS - diff)
+
+
+def touch_cosmetic_change(user_id: int):
+    db_exec("UPDATE users SET last_cosmetic_change=%s WHERE id=%s", (now_iso(), user_id))
+
+
+def format_user_link_html(user_id: int, username: Optional[str]) -> str:
+    """
+    Если username есть -> @username
+    Если нет -> кликабельный ID (tg://user?id=)
+    """
     if username:
-        return _html_escape(f"@{username}")
-    return f'<a href="tg://user?id={user_id}">ID:{user_id}</a>'
+        return f"@{username}"
+    return f'<a href="tg://user?id={user_id}">{user_id}</a>'
+
+
+def build_profile_header(vip_type: Optional[str], theme_code: Optional[str]) -> str:
+    frame = VIP_FRAMES.get(vip_type, "")
+    theme_emoji = THEMES.get(theme_code, ("", "", 0))[0] if theme_code else ""
+
+    # базовая линия
+    if theme_emoji:
+        inner = f"{theme_emoji}━━━━━━━━ ПРОФИЛЬ ━━━━━━━━{theme_emoji}"
+    else:
+        inner = "━━━━━━ ПРОФИЛЬ ━━━━━━"
+
+    if frame and theme_emoji:
+        return f"{frame}{inner}{frame}"
+    if frame and not theme_emoji:
+        return f"{frame}{inner}{frame}"
+    return inner
 
 
 def get_subscribed_ref_count(referrer_id: int) -> int:
@@ -571,7 +791,7 @@ def get_subscribed_ref_count(referrer_id: int) -> int:
     return int(row[0]) if row else 0
 
 
-def can_take_daily(last_daily_bonus: Optional[str]) -> Tuple[bool, Optional[timedelta]]:
+def can_take_daily(last_daily_bonus: Optional[str]) -> tuple[bool, Optional[timedelta]]:
     if not last_daily_bonus:
         return True, None
     try:
@@ -583,128 +803,6 @@ def can_take_daily(last_daily_bonus: Optional[str]) -> Tuple[bool, Optional[time
     if now >= next_dt:
         return True, None
     return False, (next_dt - now)
-
-
-# =========================
-# ===== CASES HELPERS =====
-# =========================
-def case_reset_if_needed(user_id: int):
-    row = db_fetchone("SELECT case_reset_at FROM users WHERE id=%s", (user_id,))
-    now = datetime.now()
-
-    if not row or not row[0]:
-        db_exec(
-            "UPDATE users SET case_reset_at=%s, case_opened_common=0, case_opened_rare=0, case_opened_legend=0 WHERE id=%s",
-            (now.isoformat(timespec="seconds"), user_id),
-        )
-        return
-
-    try:
-        last = datetime.fromisoformat(row[0])
-    except Exception:
-        db_exec(
-            "UPDATE users SET case_reset_at=%s, case_opened_common=0, case_opened_rare=0, case_opened_legend=0 WHERE id=%s",
-            (now.isoformat(timespec="seconds"), user_id),
-        )
-        return
-
-    if now >= last + timedelta(hours=CASE_RESET_HOURS):
-        db_exec(
-            "UPDATE users SET case_reset_at=%s, case_opened_common=0, case_opened_rare=0, case_opened_legend=0 WHERE id=%s",
-            (now.isoformat(timespec="seconds"), user_id),
-        )
-
-
-def case_time_left(user_id: int) -> Optional[timedelta]:
-    row = db_fetchone("SELECT case_reset_at FROM users WHERE id=%s", (user_id,))
-    if not row or not row[0]:
-        return None
-    try:
-        last = datetime.fromisoformat(row[0])
-    except Exception:
-        return None
-    next_reset = last + timedelta(hours=CASE_RESET_HOURS)
-    return next_reset - datetime.now()
-
-
-def case_roll(case_type: str) -> Tuple[str, Any]:
-    items = CASE_WEIGHTS[case_type]
-    total_w = sum(w for _, __, w in items)
-    r = int.from_bytes(os.urandom(8), "big") % total_w
-    cur = 0
-    for itype, val, w in items:
-        cur += w
-        if r < cur:
-            return itype, val
-    return items[-1][0], items[-1][1]
-
-
-async def case_animation(message, seconds: int, prefix: str):
-    steps = ["░░░░░", "█░░░░", "██░░░", "███░░", "████░"]
-    delay = seconds / len(steps)
-
-    try:
-        await message.edit_text(f"{prefix} Открываю кейс…")
-    except Exception:
-        pass
-
-    await asyncio.sleep(max(0.6, delay * 0.8))
-    for s in steps:
-        try:
-            await message.edit_text(f"🔄 Кручу… {s}")
-        except Exception:
-            pass
-        await asyncio.sleep(delay)
-
-
-def vip_until_new(current_until: Optional[str], add_days: int) -> str:
-    now = datetime.now()
-    base = now
-    if current_until:
-        try:
-            until_dt = datetime.fromisoformat(current_until)
-            if until_dt > now:
-                base = until_dt
-        except Exception:
-            base = now
-    return (base + timedelta(days=add_days)).isoformat(timespec="seconds")
-
-
-def award_vip(user_id: int, vip_type_new: str, days: int) -> Tuple[bool, str]:
-    """
-    applied=True если применили/продлили/апгрейднули.
-    applied=False если выпало ниже текущего.
-    """
-    check_and_update_vip(user_id)
-    row = db_fetchone("SELECT vip_type, vip_until, vip_base_limit, clicks_limit FROM users WHERE id=%s", (user_id,))
-    if not row:
-        return False, "❌ Пользователь не найден."
-
-    cur_type, cur_until, base_limit, clicks_limit = row
-    cur_rank = VIP_RANK.get(cur_type, 0) if cur_type else 0
-    new_rank = VIP_RANK.get(vip_type_new, 0)
-
-    if cur_rank > new_rank:
-        return False, "👑 У вас уже есть привилегия выше!"
-
-    # тот же — продлеваем
-    if cur_type and cur_type == vip_type_new:
-        new_until = vip_until_new(cur_until, days)
-        db_exec("UPDATE users SET vip_until=%s WHERE id=%s", (new_until, user_id))
-        return True, f"🎖 Привилегия продлена: {vip_type_new} +{days}д ✅"
-
-    # апгрейд или не было
-    if base_limit is None:
-        base_limit = int(clicks_limit) if clicks_limit is not None else DEFAULT_CLICKS_LIMIT
-
-    new_until = vip_until_new(cur_until if cur_type else None, days)
-    new_limit = VIP_LIMITS[vip_type_new]
-
-    db_exec(
-        "UPDATE users SET vip_type=%s, vip_until=%s, vip_base_limit=%s, clicks_limit=%s WHERE id=%s",
-        (vip_type_new, new_until, base_limit, new_limit, user_id),
-    )
-    return True, f"🎉 Получено VIP: {vip_type_new} на {days}д ✅"
 
 
 # =========================
@@ -740,8 +838,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     check_click_reset(user_id)
-    case_reset_if_needed(user_id)
-
     context.user_data.clear()
     context.user_data["menu"] = "main"
     await safe_reply(update, "✨ Добро пожаловать!", reply_markup=main_menu(user_id))
@@ -754,10 +850,7 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
         return
-    try:
-        await q.answer()
-    except Exception:
-        pass
+    await q.answer()
 
     user_id = q.from_user.id
     username = q.from_user.username
@@ -765,17 +858,12 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = q.data or ""
 
-    # BACK
+    # BACK to profile
     if data == "back_profile":
-        await send_profile(q, context, user_id)
+        await send_profile_from_message(q.message, context, user_id)
         return
 
     if data == "noop":
-        return
-
-    # ТОПЫ
-    if data == "tops":
-        await q.message.reply_text("🏆 Выберите ТОП:", reply_markup=tops_inline_menu())
         return
 
     # daily bonus
@@ -785,8 +873,9 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         ok, left = can_take_daily(last_daily)
         if not ok and left is not None:
-            await q.message.reply_text(
-                f"⏳ Ежедневный бонус уже был.\nСледующий через: {format_time_left(left)}"
+            await safe_send_message(
+                q.message,
+                f"⏳ Ежедневный бонус уже был.\nСледующий через: {format_time_left(left)}",
             )
             return
 
@@ -794,61 +883,66 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "UPDATE users SET balance=balance+%s, last_daily_bonus=%s WHERE id=%s",
             (DAILY_BONUS_AMOUNT, now_iso(), user_id),
         )
-        await q.message.reply_text(f"✅ Ежедневный бонус получен: +{DAILY_BONUS_AMOUNT} GOLD 🎁")
+        await safe_send_message(q.message, f"✅ Ежедневный бонус получен: +{DAILY_BONUS_AMOUNT} GOLD 🎁")
         return
 
-    # топ по кликам
+    # open tops menu
+    if data == "tops":
+        await safe_send_message(q.message, "🏆 Выберите ТОП:", reply_markup=tops_inline_menu())
+        return
+
+    # top clicks
     if data == "top_clicks":
         rows = db_fetchall(
-            "SELECT id, username, COALESCE(total_clicks,0) AS tc FROM users ORDER BY tc DESC, id ASC LIMIT 10"
+            """
+            SELECT id, username, COALESCE(total_clicks,0) AS tc, COALESCE(active_title,'ROOKIE') AS t
+            FROM users
+            ORDER BY tc DESC, id ASC
+            LIMIT 10
+            """
         )
         msg = "📊 ТОП по кликам (всего)\n\n"
         if not rows:
             msg += "Пока пусто."
         else:
-            lines = []
-            for i, (uid, uname, tc) in enumerate(rows, start=1):
-                lines.append(f"{i}) {safe_name_for_top_html(uname, uid)} — {int(tc)} кликов")
-            msg += "<br>".join(lines)
-
-        await q.message.reply_text(
-            msg,
-            reply_markup=tops_inline_menu(),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+            for i, (uid, uname, tc, t) in enumerate(rows, start=1):
+                tname = title_name(t)
+                ulink = format_user_link_html(uid, uname)
+                msg += f"{i}) [{tname}] {ulink} — {int(tc)} кликов\n"
+        await safe_send_message(q.message, msg, reply_markup=tops_inline_menu(), parse_mode="HTML")
         return
 
-    # топ по балансу
+    # top balance
     if data == "top_balance":
-        rows = db_fetchall("SELECT id, username, balance FROM users ORDER BY balance DESC, id ASC LIMIT 10")
+        rows = db_fetchall(
+            """
+            SELECT id, username, balance, COALESCE(active_title,'ROOKIE') AS t
+            FROM users
+            ORDER BY balance DESC, id ASC
+            LIMIT 10
+            """
+        )
         msg = "💰 ТОП по балансу\n\n"
         if not rows:
             msg += "Пока пусто."
         else:
-            lines = []
-            for i, (uid, uname, bal) in enumerate(rows, start=1):
-                lines.append(f"{i}) {safe_name_for_top_html(uname, uid)} — {round(float(bal), 2)} GOLD")
-            msg += "<br>".join(lines)
-
-        await q.message.reply_text(
-            msg,
-            reply_markup=tops_inline_menu(),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+            for i, (uid, uname, bal, t) in enumerate(rows, start=1):
+                tname = title_name(t)
+                ulink = format_user_link_html(uid, uname)
+                msg += f"{i}) [{tname}] {ulink} — {round(float(bal), 2)} GOLD\n"
+        await safe_send_message(q.message, msg, reply_markup=tops_inline_menu(), parse_mode="HTML")
         return
 
-    # топ рефоводов
+    # top refs
     if data == "top_refs":
         rows = db_fetchall(
             """
-            SELECT r.referrer_id, u.username, COUNT(*) AS c
+            SELECT r.referrer_id, u.username, COALESCE(u.active_title,'ROOKIE') AS t, COUNT(*) AS c
             FROM referrals r
             JOIN users uref ON uref.id = r.user_id
             LEFT JOIN users u ON u.id = r.referrer_id
             WHERE uref.subscribed=1
-            GROUP BY r.referrer_id, u.username
+            GROUP BY r.referrer_id, u.username, u.active_title
             ORDER BY c DESC, r.referrer_id ASC
             LIMIT 10
             """
@@ -857,203 +951,276 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not rows:
             msg += "Пока пусто."
         else:
-            lines = []
-            for i, (ref_uid, ref_uname, c) in enumerate(rows, start=1):
-                lines.append(f"{i}) {safe_name_for_top_html(ref_uname, ref_uid)} — {int(c)} рефералов")
-            msg += "<br>".join(lines)
-
-        await q.message.reply_text(
-            msg,
-            reply_markup=tops_inline_menu(),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+            for i, (ref_uid, ref_uname, t, c) in enumerate(rows, start=1):
+                tname = title_name(t)
+                ulink = format_user_link_html(ref_uid, ref_uname)
+                msg += f"{i}) [{tname}] {ulink} — {int(c)} рефералов\n"
+        await safe_send_message(q.message, msg, reply_markup=tops_inline_menu(), parse_mode="HTML")
         return
 
-    # ref bonuses
+    # open ref bonuses menu
     if data == "ref_bonuses":
-        await send_ref_bonus_menu(q, context, user_id)
+        await send_ref_bonus_menu(q.message, context, user_id)
         return
 
+    # claim ref bonus
     if data.startswith("claim_ref_"):
-        await process_claim_ref_bonus(q, context, user_id, data)
+        await process_claim_ref_bonus(q.message, context, user_id, data)
         return
 
-    # =========================
-    # ===== CASES UI ==========
-    # =========================
-    if data == "cases":
-        case_reset_if_needed(user_id)
-        row = db_fetchone("SELECT case_common, case_rare, case_legend FROM users WHERE id=%s", (user_id,))
-        common, rare, legend = row if row else (0, 0, 0)
-        await q.message.reply_text("📦 Кейсы", reply_markup=cases_inline_menu(int(common), int(rare), int(legend)))
-        return
-
-    if data == "case_shop":
-        text = (
-            "🛒 Магазин кейсов\n\n"
-            f"📦 Обычный: {CASE_PRICES['common']}G\n"
-            f"🎁 Редкий: {CASE_PRICES['rare']}G\n"
-            f"💎 Легендарный: {CASE_PRICES['legend']}G\n\n"
-            "Покупка: по 1 штуке."
+    # cosmetics
+    if data == "cosmetics":
+        await safe_send_message(
+            q.message,
+            "🎨 Косметика\n\nВыбери раздел:",
+            reply_markup=cosmetics_inline_menu(),
         )
-        await q.message.reply_text(text, reply_markup=case_shop_menu())
         return
 
-    if data == "case_drops":
-        await q.message.reply_text("ℹ️ Выбери кейс:", reply_markup=case_drops_menu())
+    if data == "cos_title":
+        await show_titles_menu(q.message, context, user_id)
         return
 
-    if data in ("drops_common", "drops_rare", "drops_legend"):
-        if data == "drops_common":
-            text = (
-                "📦 Обычный кейс — что может выпасть:\n\n"
-                "💰 100G / 250G / 700G / 1000G\n"
-                "🎖 VIP на 1 день\n"
-                "💎 MVP на 1 день\n"
-                "🏆 Джекпот: 2000G"
-            )
-        elif data == "drops_rare":
-            text = (
-                "🎁 Редкий кейс — что может выпасть:\n\n"
-                "💰 400G / 700G / 1400G / 1700G\n"
-                "💎 MVP на 3 дня\n"
-                "💲 PREMIUM на 1 день\n"
-                "🏆 Джекпот: 4000G"
-            )
+    if data == "cos_theme":
+        await show_themes_menu(q.message, context, user_id)
+        return
+
+    if data == "cos_shop":
+        await show_theme_shop(q.message, context, user_id)
+        return
+
+    # set title
+    if data.startswith("set_title:"):
+        code = data.split(":", 1)[1]
+        await set_user_title(q.message, context, user_id, code)
+        return
+
+    # set theme
+    if data.startswith("set_theme:"):
+        code = data.split(":", 1)[1]
+        await set_user_theme(q.message, context, user_id, code)
+        return
+
+    # buy theme
+    if data.startswith("buy_theme:"):
+        code = data.split(":", 1)[1]
+        await buy_theme(q.message, context, user_id, code)
+        return
+
+
+async def show_titles_menu(message, context, user_id: int):
+    cleanup_expired_cosmetics(user_id)
+
+    # выдаём прогресс-титулы на всякий (если человек давно не кликал)
+    row = db_fetchone("SELECT COALESCE(total_clicks,0) FROM users WHERE id=%s", (user_id,))
+    tc = int(row[0]) if row else 0
+    grant_progress_titles(user_id, tc)
+
+    active = get_effective_active_title(user_id)
+
+    owned = db_fetchall("SELECT code FROM titles_owned WHERE user_id=%s ORDER BY code ASC", (user_id,))
+    owned_codes = [c for (c,) in owned]
+    if "ROOKIE" not in owned_codes:
+        owned_codes = ["ROOKIE"] + owned_codes
+
+    # кнопки
+    buttons = []
+    for code in owned_codes[:15]:
+        disp = TITLE_DISPLAY.get(code, code)
+        mark = "✅ " if code == active else ""
+        buttons.append([InlineKeyboardButton(f"{mark}{disp}", callback_data=f"set_title:{code}")])
+
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="cosmetics")])
+
+    await safe_send_message(
+        message,
+        f"🏷 Титулы\n\nАктивный: [{title_name(active)}]\n\nВыбери титул:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def show_themes_menu(message, context, user_id: int):
+    cleanup_expired_cosmetics(user_id)
+    active = get_effective_active_theme(user_id)
+
+    owned = db_fetchall("SELECT code FROM themes_owned WHERE user_id=%s ORDER BY code ASC", (user_id,))
+    owned_codes = [c for (c,) in owned]
+
+    buttons = []
+    if not owned_codes:
+        await safe_send_message(
+            message,
+            "🌌 Фоны\n\nУ тебя пока нет фонов.\nОткрой магазин и купи фон 👇",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("🛒 Магазин фонов", callback_data="cos_shop")],
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="cosmetics")],
+                ]
+            ),
+        )
+        return
+
+    # кнопка снять фон
+    mark_none = "✅ " if not active else ""
+    buttons.append([InlineKeyboardButton(f"{mark_none}Без фона", callback_data="set_theme:NONE")])
+
+    for code in owned_codes[:15]:
+        em, name, _ = THEMES.get(code, ("", code, 0))
+        mark = "✅ " if code == active else ""
+        buttons.append([InlineKeyboardButton(f"{mark}{em} {name}", callback_data=f"set_theme:{code}")])
+
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="cosmetics")])
+
+    active_text = "нет" if not active else f"{THEMES.get(active, ('', active, 0))[0]} {THEMES.get(active, ('', active, 0))[1]}"
+    await safe_send_message(
+        message,
+        f"🌌 Фоны\n\nАктивный: {active_text}\n\nВыбери фон:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def show_theme_shop(message, context, user_id: int):
+    cleanup_expired_cosmetics(user_id)
+    row = db_fetchone("SELECT balance FROM users WHERE id=%s", (user_id,))
+    bal = float(row[0]) if row else 0.0
+
+    text = "🛒 Магазин фонов\n\n"
+    text += f"💰 Баланс: {round(bal, 2)} GOLD\n\n"
+    text += "Выбери фон для покупки (по 1):"
+
+    buttons = []
+    for code, (em, name, price) in THEMES.items():
+        owned = user_has_theme(user_id, code)
+        label = f"{em} {name} — {price}G"
+        if owned:
+            label = f"✅ {label}"
+            buttons.append([InlineKeyboardButton(label, callback_data="noop")])
         else:
-            text = (
-                "💎 Легендарный кейс — что может выпасть:\n\n"
-                "💰 1000G / 1500G / 3300G / 3900G\n"
-                "💎 MVP на 5 дней\n"
-                "💲 PREMIUM на 3 дня\n"
-                "🏆 Джекпот: 6500G"
-            )
-        await q.message.reply_text(text, reply_markup=case_drops_menu())
+            buttons.append([InlineKeyboardButton(label, callback_data=f"buy_theme:{code}")])
+
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="cosmetics")])
+
+    await safe_send_message(message, text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def set_user_title(message, context, user_id: int, code: str):
+    if code == "NONE":
+        code = "ROOKIE"
+
+    cleanup_expired_cosmetics(user_id)
+    if code != "ROOKIE" and not user_has_title(user_id, code):
+        await safe_send_message(message, "❌ У тебя нет такого титула.", reply_markup=back_to_cosmetics_menu())
         return
 
-    if data in ("buy_case_common", "buy_case_rare", "buy_case_legend"):
-        ctype = "common" if data.endswith("common") else "rare" if data.endswith("rare") else "legend"
-        price = CASE_PRICES[ctype]
-
-        row = db_fetchone("SELECT balance FROM users WHERE id=%s", (user_id,))
-        bal = float(row[0]) if row else 0.0
-
-        if bal < price:
-            await q.message.reply_text("❌ Недостаточно средств.", reply_markup=case_shop_menu())
-            return
-
-        db_exec(f"UPDATE users SET balance=balance-%s, case_{ctype}=case_{ctype}+1 WHERE id=%s", (price, user_id))
-        await q.message.reply_text("✅ Покупка успешна!", reply_markup=case_shop_menu())
+    ok, left = can_change_cosmetic(user_id)
+    if not ok:
+        await safe_send_message(message, f"⏳ Подожди {left} сек перед сменой косметики.", reply_markup=back_to_cosmetics_menu())
         return
 
-    if data in ("open_case_common", "open_case_rare", "open_case_legend"):
-        ctype = "common" if data.endswith("common") else "rare" if data.endswith("rare") else "legend"
+    db_exec("UPDATE users SET active_title=%s WHERE id=%s", (code, user_id))
+    touch_cosmetic_change(user_id)
 
-        # защита от спама (память)
-        if context.user_data.get("case_opening"):
-            await q.message.reply_text("⏳ Подожди, кейс открывается…")
+    await safe_send_message(message, f"✅ Титул установлен: [{title_name(code)}]", reply_markup=back_to_cosmetics_menu())
+
+
+async def set_user_theme(message, context, user_id: int, code: str):
+    cleanup_expired_cosmetics(user_id)
+
+    if code == "NONE":
+        ok, left = can_change_cosmetic(user_id)
+        if not ok:
+            await safe_send_message(message, f"⏳ Подожди {left} сек перед сменой косметики.", reply_markup=back_to_cosmetics_menu())
             return
-
-        # защита от спама (БД)
-        row_open = db_fetchone("SELECT opening_case FROM users WHERE id=%s", (user_id,))
-        if row_open and int(row_open[0] or 0) == 1:
-            await q.message.reply_text("⏳ Подожди, кейс открывается…")
-            return
-
-        case_reset_if_needed(user_id)
-
-        row = db_fetchone(
-            f"SELECT case_{ctype}, case_opened_{ctype} FROM users WHERE id=%s",
-            (user_id,),
-        )
-        if not row:
-            await q.message.reply_text("❌ Ошибка профиля. Напиши /start")
-            return
-
-        have, opened = int(row[0]), int(row[1])
-        limit = CASE_LIMITS[ctype]
-
-        if have <= 0:
-            rowc = db_fetchone("SELECT case_common, case_rare, case_legend FROM users WHERE id=%s", (user_id,))
-            common, rare, legend = rowc if rowc else (0, 0, 0)
-            await q.message.reply_text(
-                "❌ У вас нет кейсов этого типа.\n🛒 Купите в магазине.",
-                reply_markup=cases_inline_menu(int(common), int(rare), int(legend)),
-            )
-            return
-
-        if opened >= limit:
-            left = case_time_left(user_id)
-            left_text = format_time_left(left) if left else "скоро"
-            await q.message.reply_text(f"⏳ Лимит открытий исчерпан.\nОбновление через: {left_text}")
-            return
-
-        # блокируем
-        context.user_data["case_opening"] = True
-        db_exec("UPDATE users SET opening_case=1 WHERE id=%s", (user_id,))
-
-        prefix = "📦" if ctype == "common" else "🎁" if ctype == "rare" else "💎"
-        try:
-            msg = await q.message.reply_text(f"{prefix} Открываю кейс…")
-            await case_animation(msg, CASE_ANIM_SECONDS[ctype], prefix)
-
-            itype, val = case_roll(ctype)
-
-            # выдача
-            if itype == "gold":
-                amount = int(val)
-                db_exec("UPDATE users SET balance=balance+%s WHERE id=%s", (amount, user_id))
-                result_text = f"🎉 Выпало: +{amount} GOLD"
-            else:
-                vip_name, days = val
-                applied, message_text = award_vip(user_id, vip_name, int(days))
-                result_text = message_text if applied else message_text + f"\n(Выпало: {vip_name} на {days}д)"
-
-            # списать кейс и засчитать открытие
-            db_exec(
-                f"""
-                UPDATE users SET
-                    case_{ctype}=case_{ctype}-1,
-                    case_opened_{ctype}=case_opened_{ctype}+1
-                WHERE id=%s
-                """,
-                (user_id,),
-            )
-
-            try:
-                await msg.edit_text(result_text)
-            except Exception:
-                await q.message.reply_text(result_text)
-
-        finally:
-            context.user_data["case_opening"] = False
-            db_exec("UPDATE users SET opening_case=0 WHERE id=%s", (user_id,))
-
+        db_exec("UPDATE users SET active_theme=NULL WHERE id=%s", (user_id,))
+        touch_cosmetic_change(user_id)
+        await safe_send_message(message, "✅ Фон снят.", reply_markup=back_to_cosmetics_menu())
         return
 
+    if code not in THEMES:
+        await safe_send_message(message, "❌ Неизвестный фон.", reply_markup=back_to_cosmetics_menu())
+        return
 
-async def send_profile(q, context, user_id: int):
+    if not user_has_theme(user_id, code):
+        await safe_send_message(message, "❌ У тебя нет этого фона.", reply_markup=back_to_cosmetics_menu())
+        return
+
+    ok, left = can_change_cosmetic(user_id)
+    if not ok:
+        await safe_send_message(message, f"⏳ Подожди {left} сек перед сменой косметики.", reply_markup=back_to_cosmetics_menu())
+        return
+
+    db_exec("UPDATE users SET active_theme=%s WHERE id=%s", (code, user_id))
+    touch_cosmetic_change(user_id)
+
+    em, name, _ = THEMES[code]
+    await safe_send_message(message, f"✅ Фон установлен: {em} {name}", reply_markup=back_to_cosmetics_menu())
+
+
+async def buy_theme(message, context, user_id: int, code: str):
+    if code not in THEMES:
+        await safe_send_message(message, "❌ Неизвестный фон.", reply_markup=back_to_cosmetics_menu())
+        return
+
+    cleanup_expired_cosmetics(user_id)
+    if user_has_theme(user_id, code):
+        await safe_send_message(message, "✅ У тебя уже есть этот фон.", reply_markup=back_to_cosmetics_menu())
+        return
+
+    em, name, price = THEMES[code]
+    row = db_fetchone("SELECT balance FROM users WHERE id=%s", (user_id,))
+    bal = float(row[0]) if row else 0.0
+
+    if bal < price:
+        await safe_send_message(message, f"❌ Не хватает GOLD. Нужно: {price}G", reply_markup=back_to_cosmetics_menu())
+        return
+
+    db_exec("UPDATE users SET balance=balance-%s WHERE id=%s", (price, user_id))
+    grant_theme(user_id, code, expires_at=None)
+
+    await safe_send_message(message, f"✅ Куплено: {em} {name} за {price}G", reply_markup=back_to_cosmetics_menu())
+
+
+# =========================
+# ===== ПРОФИЛЬ/РЕФ-БОНУСЫ
+# =========================
+async def send_profile_from_message(message, context, user_id: int):
     vip_type, vip_until_dt = check_and_update_vip(user_id)
+
+    # подстрахуем лимит у старых записей
+    db_exec("UPDATE users SET clicks_limit=%s WHERE clicks_limit=1500", (DEFAULT_CLICKS_LIMIT,))
 
     row = db_fetchone(
         "SELECT balance, clicks_used, clicks_limit, COALESCE(total_clicks,0), username FROM users WHERE id=%s",
         (user_id,),
     )
     if row:
-        bal, _, _, total_clicks, stored_username = row
+        bal, used_now, limit_now, total_clicks, stored_username = row
     else:
-        bal, total_clicks, stored_username = (0, 0, None)
+        bal, used_now, limit_now, total_clicks, stored_username = (0, 0, DEFAULT_CLICKS_LIMIT, 0, None)
+
+    # прогресс-титулы
+    grant_progress_titles(user_id, int(total_clicks))
 
     used, next_reset, limit = check_click_reset(user_id)
 
-    nick = get_display_nick(user_id, stored_username, vip_type)
+    active_title_code = get_effective_active_title(user_id)
+    active_theme_code = get_effective_active_theme(user_id)
+
+    header = build_profile_header(vip_type, active_theme_code)
+
+    ulink = format_user_link_html(user_id, stored_username)
+    title_text = title_name(active_title_code)
     vip_status_text = vip_type if vip_type else "нет"
     vip_left_text = format_time_left(vip_until_dt - datetime.now()) if vip_until_dt else "нет VIP статуса"
 
-    await q.message.reply_text(
-        "👤 Профиль\n"
-        f"Ваш ник: {nick}\n"
+    # ник + иконка VIP (как раньше)
+    vip_icon = VIP_ICONS.get(vip_type, "") if vip_type else ""
+    nick_line = f"[{title_text}] {ulink}{vip_icon}"
+
+    await safe_send_message(
+        message,
+        f"{header}\n"
+        f"{nick_line}\n"
         f"VIP статус: {vip_status_text}\n"
         f"Срок VIP статуса: {vip_left_text}\n\n"
         f"💰 Баланс: {round(float(bal), 2)} GOLD\n"
@@ -1061,11 +1228,13 @@ async def send_profile(q, context, user_id: int):
         f"🏁 Клики (всего): {int(total_clicks)}\n"
         f"⏳ До обновления: {format_time_left(next_reset - datetime.now())}",
         reply_markup=profile_inline_menu(),
+        parse_mode="HTML",
     )
 
 
-async def send_ref_bonus_menu(q, context, user_id: int):
+async def send_ref_bonus_menu(message, context, user_id: int):
     ref_count = get_subscribed_ref_count(user_id)
+
     row = db_fetchone(
         "SELECT ref_bonus_10, ref_bonus_50, ref_bonus_100 FROM users WHERE id=%s",
         (user_id,),
@@ -1081,13 +1250,14 @@ async def send_ref_bonus_menu(q, context, user_id: int):
         "• 100 рефов → +10000G\n\n"
         "Нажми кнопку, чтобы забрать (если выполнено)."
     )
-    await q.message.reply_text(
+    await safe_send_message(
+        message,
         text,
-        reply_markup=ref_bonuses_inline_menu(int(claimed10), int(claimed50), int(claimed100)),
+        reply_markup=ref_bonuses_inline_menu(user_id, ref_count, claimed10, claimed50, claimed100),
     )
 
 
-async def process_claim_ref_bonus(q, context, user_id: int, data: str):
+async def process_claim_ref_bonus(message, context, user_id: int, data: str):
     ref_count = get_subscribed_ref_count(user_id)
 
     if data == "claim_ref_10":
@@ -1102,16 +1272,16 @@ async def process_claim_ref_bonus(q, context, user_id: int, data: str):
     row = db_fetchone(f"SELECT {col} FROM users WHERE id=%s", (user_id,))
     already = int(row[0]) if row else 0
     if already:
-        await q.message.reply_text("✅ Ты уже забрал эту награду.")
+        await safe_send_message(message, "✅ Ты уже забрал эту награду.")
         return
 
     if ref_count < need:
-        await q.message.reply_text(f"❌ Нужно {need} подписанных рефералов. Сейчас: {ref_count}")
+        await safe_send_message(message, f"❌ Нужно {need} подписанных рефералов. Сейчас: {ref_count}")
         return
 
     db_exec(f"UPDATE users SET balance=balance+%s, {col}=1 WHERE id=%s", (reward, user_id))
-    await q.message.reply_text(f"🎉 Награда получена: +{reward} GOLD ✅")
-    await send_ref_bonus_menu(q, context, user_id)
+    await safe_send_message(message, f"🎉 Награда получена: +{reward} GOLD ✅")
+    await send_ref_bonus_menu(message, context, user_id)
 
 
 # =========================
@@ -1204,7 +1374,6 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ensure_user(user_id, username=username)
     check_and_update_vip(user_id)
-    case_reset_if_needed(user_id)
 
     # бан (кроме админа)
     if user_id != ADMIN_ID:
@@ -1238,10 +1407,7 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ПРОФИЛЬ
     if text == "👤 Профиль":
         await safe_reply(update, "Открываю профиль 👇", reply_markup=main_menu(user_id))
-        fake_q = type("Q", (), {})()
-        fake_q.message = update.message
-        fake_q.from_user = update.effective_user
-        await send_profile(fake_q, context, user_id)
+        await send_profile_from_message(update.message, context, user_id)
         return
 
     # ЗАРАБОТАТЬ
@@ -1261,6 +1427,7 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_reply(update, "❌ У вас закончились клики", reply_markup=main_menu(user_id))
             return
 
+        # обновляем и получаем total_clicks
         db_exec(
             """
             UPDATE users
@@ -1271,8 +1438,21 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """,
             (CLICK_REWARD, user_id),
         )
+
+        row = db_fetchone("SELECT COALESCE(total_clicks,0) FROM users WHERE id=%s", (user_id,))
+        total_clicks = int(row[0]) if row else 0
+
+        # прогресс-титулы (если новый — покажем)
+        new_titles = grant_progress_titles(user_id, total_clicks)
+
         used += 1
-        await safe_reply(update, f"✅ Заработано {CLICK_REWARD} GOLD ({used}/{limit})", reply_markup=earn_menu())
+        msg = f"✅ Заработано {CLICK_REWARD} GOLD ({used}/{limit})"
+        if new_titles:
+            # покажем самый свежий
+            last_code = new_titles[-1]
+            msg += f"\n🎉 Открыт новый титул: [{TITLE_DISPLAY.get(last_code, last_code)}] (выбери в 🎨 Косметика)"
+
+        await safe_reply(update, msg, reply_markup=earn_menu())
         return
 
     # РЕФЕРАЛКА
@@ -1308,23 +1488,22 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if context.user_data.get("menu") == "promo":
-        code = text.strip()
-        res = db_fetchone("SELECT amount, uses_left FROM promocodes WHERE code=%s", (code,))
+        res = db_fetchone("SELECT amount, uses_left FROM promocodes WHERE code=%s", (text,))
         if not res:
             await safe_reply(update, "❌ Неверный промокод", reply_markup=main_menu(user_id))
         else:
             amount, uses_left = res
-            used_row = db_fetchone("SELECT 1 FROM used_promocodes WHERE user_id=%s AND code=%s", (user_id, code))
+            used_row = db_fetchone("SELECT 1 FROM used_promocodes WHERE user_id=%s AND code=%s", (user_id, text))
             if used_row:
                 await safe_reply(update, "❌ Уже использован", reply_markup=main_menu(user_id))
             elif int(uses_left) <= 0:
                 await safe_reply(update, "❌ Промокод недействителен", reply_markup=main_menu(user_id))
             else:
                 db_exec("UPDATE users SET balance=balance+%s WHERE id=%s", (amount, user_id))
-                db_exec("UPDATE promocodes SET uses_left=uses_left-1 WHERE code=%s", (code,))
+                db_exec("UPDATE promocodes SET uses_left=uses_left-1 WHERE code=%s", (text,))
                 db_exec(
                     "INSERT INTO used_promocodes (user_id, code) VALUES (%s,%s) ON CONFLICT DO NOTHING",
-                    (user_id, code),
+                    (user_id, text),
                 )
                 await safe_reply(update, f"🎉 ПРОМО АКТИВИРОВАН\n💰 +{amount} GOLD", reply_markup=main_menu(user_id))
         context.user_data.clear()
@@ -1343,9 +1522,9 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update,
             "Введите сумму:\n\n"
             "📌 Примечание для вывода:\n"
-            "• Указывайте только целую сумму от 2000\n"
-            "• Примеры: 2000 / 4000 / 6000 / 8000 / 10000\n"
-            "❌ Не нужно: 2100, 2500, 2780 и т.д.",
+            "• Указывайте только целую сумму от 1000\n"
+            "• Примеры: 1000 / 2000 / 3000 / 4000\n"
+            "❌ Не нужно: 1100, 1500, 1780 и т.д.",
             reply_markup=cancel_menu(),
         )
         return
@@ -1356,7 +1535,7 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             row = db_fetchone("SELECT balance FROM users WHERE id=%s", (user_id,))
             bal = float(row[0]) if row else 0
 
-            if amount < MIN_WITHDRAW or amount > bal or int(amount) != amount:
+            if amount < MIN_WITHDRAW or amount > bal:
                 await safe_reply(update, "❌ Неверная сумма", reply_markup=cancel_menu())
                 return
 
@@ -1404,7 +1583,7 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(
             update,
             "🛠 Админ панель\n\n"
-            "Команды для заявок на вывод:\n"
+            "Команды для вывода:\n"
             "✅ done 3 текст\n"
             "❌ cancel 3 причина",
             reply_markup=admin_menu(),
@@ -1419,7 +1598,7 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id == ADMIN_ID and menu == "admin" and admin_action is None:
         if text == "Создать промокод":
             context.user_data["admin_action"] = "create_promocode"
-            await safe_reply(update, "КОД СУММА КОЛ-ВО\nПример: KISS 10 5", reply_markup=cancel_menu())
+            await safe_reply(update, "Код Сумма Кол-во\nПример: KISS 10 5", reply_markup=cancel_menu())
             return
 
         if text == "Выдать баланс":
@@ -1444,7 +1623,45 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if text == "🎖 Выдать привилегию":
             context.user_data["admin_action"] = "give_vip"
-            await safe_reply(update, "Формат:\nID VIP 1 день\nID MVP 3 дня\nID PREMIUM 1 день", reply_markup=cancel_menu())
+            await safe_reply(
+                update,
+                "Формат:\n"
+                "ID VIP 1 час\n"
+                "ID MVP 300 минут\n"
+                "ID PREMIUM 2 дня\n"
+                "или коротко: 12ч / 300м / 2д\n"
+                "Infinity — навсегда",
+                reply_markup=cancel_menu(),
+            )
+            return
+
+        if text == "🏷 Выдать титул":
+            context.user_data["admin_action"] = "give_title"
+            await safe_reply(
+                update,
+                "Формат:\n"
+                "ID TITLE_CODE 7д\n"
+                "ID TITLE_CODE 12ч\n"
+                "ID TITLE_CODE 300м\n"
+                "ID TITLE_CODE Infinity\n\n"
+                "Пример: 123456789 LEGEND Infinity",
+                reply_markup=cancel_menu(),
+            )
+            return
+
+        if text == "🌌 Выдать фон":
+            context.user_data["admin_action"] = "give_theme"
+            await safe_reply(
+                update,
+                "Формат:\n"
+                "ID THEME_CODE 7д\n"
+                "ID THEME_CODE 12ч\n"
+                "ID THEME_CODE 300м\n"
+                "ID THEME_CODE Infinity\n\n"
+                "Коды: FIRE, DARK, CRYSTAL, ICE, NEWYEAR, CHOC, TOP\n"
+                "Пример: 123456789 TOP Infinity",
+                reply_markup=cancel_menu(),
+            )
             return
 
         if text == "Рассылка":
@@ -1473,7 +1690,7 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if text == "Все промокоды":
-            rows = db_fetchall("SELECT code, amount, uses_left FROM promocodes ORDER BY code ASC")
+            rows = db_fetchall("SELECT code, amount, uses_left FROM promocodes")
             if not rows:
                 await safe_reply(update, "Промокодов пока нет", reply_markup=admin_menu())
             else:
@@ -1530,7 +1747,7 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             elif admin_action == "set_click_limit":
                 if len(parts) != 2:
-                    await safe_reply(update, "❌ Формат: ID ЛИМИТ", reply_markup=cancel_menu())
+                    await safe_reply(update, "❌ Формат: ID НОВЫЙ_ЛИМИТ", reply_markup=cancel_menu())
                     return
                 uid, limit = int(parts[0]), int(parts[1])
                 ensure_user(uid)
@@ -1538,23 +1755,102 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await safe_reply(update, f"✅ Лимит кликов для {uid} = {limit}", reply_markup=admin_menu())
 
             elif admin_action == "give_vip":
-                if len(parts) != 3:
-                    await safe_reply(update, "❌ Формат: ID VIP 3 (дни)", reply_markup=cancel_menu())
+                # Поддержка:
+                # ID VIP 1 час
+                # ID MVP 300 минут
+                # ID PREMIUM 2 дня
+                # коротко: 12ч / 300м / 2д
+                # Infinity
+                if len(parts) < 3:
+                    await safe_reply(update, "❌ Формат:\nID VIP 1 час\nID MVP 300 минут\nID PREMIUM 2 дня\nили 12ч/300м/2д\nInfinity", reply_markup=cancel_menu())
                     return
+
                 uid = int(parts[0])
                 vip = parts[1].upper()
-                days = int(parts[2])
-
                 if vip not in VIP_LIMITS:
-                    await safe_reply(update, "❌ Только VIP / MVP / PREMIUM", reply_markup=cancel_menu())
+                    await safe_reply(update, "❌ Привилегия только: VIP / MVP / PREMIUM", reply_markup=cancel_menu())
                     return
-                if days <= 0:
-                    await safe_reply(update, "❌ Дни должны быть > 0", reply_markup=cancel_menu())
-                    return
+
+                is_inf, dur, shown = parse_admin_time(parts, 2)
+                if is_inf:
+                    # навсегда -> ставим далеко-далеко
+                    until = datetime.now() + timedelta(days=3650)
+                    shown = "Infinity"
+                else:
+                    if dur is None:
+                        await safe_reply(update, "❌ Время: 300 минут / 1 час / 2 дня или 300м/1ч/2д", reply_markup=cancel_menu())
+                        return
+                    until = datetime.now() + dur
 
                 ensure_user(uid)
-                applied, msg = award_vip(uid, vip, days)
-                await safe_reply(update, msg, reply_markup=admin_menu())
+                row = db_fetchone("SELECT clicks_limit FROM users WHERE id=%s", (uid,))
+                current_limit = int(row[0]) if row else DEFAULT_CLICKS_LIMIT
+
+                new_limit = VIP_LIMITS[vip]
+
+                db_exec(
+                    "UPDATE users SET vip_type=%s, vip_until=%s, vip_base_limit=%s, clicks_limit=%s WHERE id=%s",
+                    (vip, until.isoformat(), current_limit, new_limit, uid),
+                )
+                await safe_reply(update, f"✅ Привилегия выдана {uid}: {vip} ({shown})", reply_markup=admin_menu())
+
+            elif admin_action == "give_title":
+                # Формат: ID CODE 7д/12ч/300м/Infinity
+                if len(parts) < 3:
+                    await safe_reply(update, "❌ Формат: ID TITLE_CODE 7д/12ч/300м/Infinity\nПример: 123 LEGEND Infinity", reply_markup=cancel_menu())
+                    return
+
+                uid = int(parts[0])
+                code = parts[1].upper()
+
+                if code not in TITLE_DISPLAY:
+                    await safe_reply(update, "❌ Неизвестный TITLE_CODE", reply_markup=cancel_menu())
+                    return
+
+                is_inf, dur, shown = parse_admin_time(parts, 2)
+                expires_at = None
+                if is_inf:
+                    expires_at = None
+                    shown = "Infinity"
+                else:
+                    if dur is None:
+                        await safe_reply(update, "❌ Время: 7д/12ч/300м или 7 дней / 12 часов / 300 минут", reply_markup=cancel_menu())
+                        return
+                    expires_at = (datetime.now() + dur).isoformat(timespec="seconds")
+
+                ensure_user(uid)
+                grant_title(uid, code, expires_at=expires_at)
+
+                await safe_reply(update, f"✅ Титул выдан {uid}: {TITLE_DISPLAY.get(code, code)} ({shown})", reply_markup=admin_menu())
+
+            elif admin_action == "give_theme":
+                # Формат: ID THEME_CODE 7д/12ч/300м/Infinity
+                if len(parts) < 3:
+                    await safe_reply(update, "❌ Формат: ID THEME_CODE 7д/12ч/300м/Infinity\nПример: 123 TOP Infinity", reply_markup=cancel_menu())
+                    return
+
+                uid = int(parts[0])
+                code = parts[1].upper()
+
+                if code not in THEMES:
+                    await safe_reply(update, "❌ Неизвестный THEME_CODE", reply_markup=cancel_menu())
+                    return
+
+                is_inf, dur, shown = parse_admin_time(parts, 2)
+                expires_at = None
+                if is_inf:
+                    expires_at = None
+                    shown = "Infinity"
+                else:
+                    if dur is None:
+                        await safe_reply(update, "❌ Время: 7д/12ч/300м или 7 дней / 12 часов / 300 минут", reply_markup=cancel_menu())
+                        return
+                    expires_at = (datetime.now() + dur).isoformat(timespec="seconds")
+
+                ensure_user(uid)
+                grant_theme(uid, code, expires_at=expires_at)
+
+                await safe_reply(update, f"✅ Фон выдан {uid}: {THEMES[code][0]} {THEMES[code][1]} ({shown})", reply_markup=admin_menu())
 
             elif admin_action == "broadcast":
                 msg = text
@@ -1564,7 +1860,6 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     try:
                         await context.bot.send_message(chat_id=uid, text=msg)
                         sent += 1
-                        await asyncio.sleep(0.05)
                     except Exception:
                         pass
                 await safe_reply(update, f"✅ Рассылка завершена. Отправлено: {sent}", reply_markup=admin_menu())
@@ -1602,15 +1897,15 @@ def main():
     db_connect()
     init_db()
 
-    db_exec(
-    "UPDATE users SET clicks_limit=%s WHERE clicks_limit=%s",
-    (2000, 1500)
-)
+    # ✅ Обновляем лимит кликов у старых юзеров (можно оставить навсегда)
+    db_exec("UPDATE users SET clicks_limit=%s WHERE clicks_limit=1500", (DEFAULT_CLICKS_LIMIT,))
 
     app = ApplicationBuilder().token(TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
+
+    # ✅ один inline handler для всего
     app.add_handler(CallbackQueryHandler(inline_handler))
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handler))
     app.add_error_handler(error_handler)
 
@@ -1620,7 +1915,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
