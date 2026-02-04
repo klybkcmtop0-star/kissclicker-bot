@@ -32,9 +32,9 @@ ADMIN_ID = 1924971257
 CHANNEL_ID = "@kisspromochannel"
 
 CLICK_REWARD = 1
-MIN_WITHDRAW = 1000
+MIN_WITHDRAW = 2000
 
-DEFAULT_CLICKS_LIMIT = 1500
+DEFAULT_CLICKS_LIMIT = 2000
 CLICK_RESET_HOURS = 3
 REF_REWARD = 250
 
@@ -1615,4 +1615,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
