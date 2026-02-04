@@ -39,7 +39,7 @@ REF_REWARD = 150
 DAILY_BONUS_AMOUNT = 500
 DAILY_BONUS_HOURS = 24
 
-VIP_LIMITS = {"VIP": 2500, "MVP": 3000, "PREMIUM": 4000}
+VIP_LIMITS = {"VIP": 3000, "MVP": 3500, "PREMIUM": 4500}
 VIP_ICONS = {"VIP": "🏆", "MVP": "💎", "PREMIUM": "💲"}
 VIP_FRAMES = {"VIP": "💎", "MVP": "🏆", "PREMIUM": "🔥"}  # ✅ рамка всегда главнее
 
@@ -1915,3 +1915,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
