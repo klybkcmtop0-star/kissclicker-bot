@@ -173,7 +173,7 @@ def init_db():
             balance DOUBLE PRECISION DEFAULT 0,
             banned INTEGER DEFAULT 0,
             clicks_used INTEGER DEFAULT 0,
-            clicks_limit INTEGER DEFAULT 1500,
+            clicks_limit INTEGER DEFAULT 2000,
             last_click_reset TEXT,
             subscribed INTEGER DEFAULT 0
         )
@@ -1602,6 +1602,11 @@ def main():
     db_connect()
     init_db()
 
+    db_exec(
+    "UPDATE users SET clicks_limit=%s WHERE clicks_limit=%s",
+    (2000, 1500)
+)
+
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -1615,6 +1620,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
