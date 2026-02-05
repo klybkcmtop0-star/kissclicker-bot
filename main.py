@@ -70,7 +70,7 @@ TITLE_NAMES = {
     "DEV": "DEV",
     "OWNER": "OWNER",
 
-    # новые:
+    # новые титулы
     "GOD": "God",
     "HACKER": "Hacker",
     "BETA_CREATOR": "Beta Creator",
@@ -161,9 +161,10 @@ def click_reward_by_level(lvl: int) -> int:
 CASE_PRICES = {"common": 500, "rare": 1000, "legend": 3000}
 CASE_LIMITS_12H = {"common": 7, "rare": 4, "legend": 2}
 CASE_RESET_HOURS = 12
-CASE_OPEN_COOLDOWN_SEC = 8
+CASE_OPEN_COOLDOWN_SEC = 8  # “интрига” 7–10 сек
 
-# Подкрученный дроп (вариант C) — суммы/шансы = 100%
+# Подкрученный дроп (вариант C)
+# ВАЖНО: суммы/шансы ровно 100%
 CASE_DROPS = {
     "common": [
         ("GOLD", 100, 45),
@@ -265,18 +266,13 @@ def db_fetchall(query: str, params: tuple = ()):
         return cur.fetchall()
 
 def migrate_add_column(sql: str):
-    """Надёжная миграция: если уже есть — просто игнор."""
+    # безопасно пытаемся выполнить ALTER, даже если старая схема/права/и т.д.
     try:
         db_exec(sql)
     except Exception as e:
-        # duplicate_column / already exists — игнор
-        msg = str(e).lower()
-        if "already exists" in msg or "duplicate" in msg:
-            return
-        raise
+        logger.warning(f"Migration skipped/failed: {e}")
 
 def init_db():
-    # базовые таблицы
     db_exec(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -332,41 +328,118 @@ def init_db():
         """
     )
 
-    # ===== МИГРАЦИИ БЕЗ DO $$ (чтобы точно работало) =====
-    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS vip_type TEXT DEFAULT NULL")
-    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS vip_until TEXT DEFAULT NULL")
-    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS vip_base_limit INTEGER DEFAULT NULL")
+    # Косметика/улучшения/кейсы
+    db_exec(
+        """
+        DO $$
+        BEGIN
+            -- VIP
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='vip_type')
+                THEN ALTER TABLE users ADD COLUMN vip_type TEXT DEFAULT NULL;
+            END IF;
 
-    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS total_clicks BIGINT DEFAULT 0")
-    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT DEFAULT NULL")
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='vip_until')
+                THEN ALTER TABLE users ADD COLUMN vip_until TEXT DEFAULT NULL;
+            END IF;
 
-    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_daily_bonus TEXT DEFAULT NULL")
-    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS ref_bonus_10 INTEGER DEFAULT 0")
-    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS ref_bonus_50 INTEGER DEFAULT 0")
-    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS ref_bonus_100 INTEGER DEFAULT 0")
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='vip_base_limit')
+                THEN ALTER TABLE users ADD COLUMN vip_base_limit INTEGER DEFAULT NULL;
+            END IF;
 
-    migrate_add_column("ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS admin_note TEXT DEFAULT NULL")
-    migrate_add_column("ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS decided_at TEXT DEFAULT NULL")
+            -- total clicks
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='total_clicks')
+                THEN ALTER TABLE users ADD COLUMN total_clicks BIGINT DEFAULT 0;
+            END IF;
 
-    migrate_add_column(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS base_click_limit INTEGER DEFAULT {BASE_CLICK_LIMIT_DEFAULT}")
-    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS upgrade_level INTEGER DEFAULT 0")
+            -- username для топов
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='username')
+                THEN ALTER TABLE users ADD COLUMN username TEXT DEFAULT NULL;
+            END IF;
 
-    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS active_title TEXT DEFAULT 'ROOKIE'")
-    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS active_theme TEXT DEFAULT NULL")
+            -- ежедневный бонус
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='last_daily_bonus')
+                THEN ALTER TABLE users ADD COLUMN last_daily_bonus TEXT DEFAULT NULL;
+            END IF;
 
-    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_cosmetic_change TEXT DEFAULT NULL")
+            -- бонусы за рефералов
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='ref_bonus_10')
+                THEN ALTER TABLE users ADD COLUMN ref_bonus_10 INTEGER DEFAULT 0;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='ref_bonus_50')
+                THEN ALTER TABLE users ADD COLUMN ref_bonus_50 INTEGER DEFAULT 0;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='ref_bonus_100')
+                THEN ALTER TABLE users ADD COLUMN ref_bonus_100 INTEGER DEFAULT 0;
+            END IF;
 
-    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS cases_common INTEGER DEFAULT 0")
-    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS cases_rare INTEGER DEFAULT 0")
-    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS cases_legend INTEGER DEFAULT 0")
+            -- withdrawals admin fields
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='withdrawals' AND column_name='admin_note')
+                THEN ALTER TABLE withdrawals ADD COLUMN admin_note TEXT DEFAULT NULL;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='withdrawals' AND column_name='decided_at')
+                THEN ALTER TABLE withdrawals ADD COLUMN decided_at TEXT DEFAULT NULL;
+            END IF;
 
-    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS case_open_common INTEGER DEFAULT 0")
-    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS case_open_rare INTEGER DEFAULT 0")
-    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS case_open_legend INTEGER DEFAULT 0")
-    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS case_reset_at TEXT DEFAULT NULL")
+            -- базовый лимит кликов
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='base_click_limit')
+                THEN ALTER TABLE users ADD COLUMN base_click_limit INTEGER DEFAULT 2000;
+            END IF;
 
-    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_case_open TEXT DEFAULT NULL")
-    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_casino_play TEXT DEFAULT NULL")
+            -- уровень улучшений
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='upgrade_level')
+                THEN ALTER TABLE users ADD COLUMN upgrade_level INTEGER DEFAULT 0;
+            END IF;
+
+            -- активный титул/фон
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='active_title')
+                THEN ALTER TABLE users ADD COLUMN active_title TEXT DEFAULT 'ROOKIE';
+            END IF;
+
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='active_theme')
+                THEN ALTER TABLE users ADD COLUMN active_theme TEXT DEFAULT NULL;
+            END IF;
+
+            -- антиспам смены косметики
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='last_cosmetic_change')
+                THEN ALTER TABLE users ADD COLUMN last_cosmetic_change TEXT DEFAULT NULL;
+            END IF;
+
+            -- инвентарь кейсов
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='cases_common')
+                THEN ALTER TABLE users ADD COLUMN cases_common INTEGER DEFAULT 0;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='cases_rare')
+                THEN ALTER TABLE users ADD COLUMN cases_rare INTEGER DEFAULT 0;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='cases_legend')
+                THEN ALTER TABLE users ADD COLUMN cases_legend INTEGER DEFAULT 0;
+            END IF;
+
+            -- лимиты открытий кейсов за 12ч
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='case_open_common')
+                THEN ALTER TABLE users ADD COLUMN case_open_common INTEGER DEFAULT 0;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='case_open_rare')
+                THEN ALTER TABLE users ADD COLUMN case_open_rare INTEGER DEFAULT 0;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='case_open_legend')
+                THEN ALTER TABLE users ADD COLUMN case_open_legend INTEGER DEFAULT 0;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='case_reset_at')
+                THEN ALTER TABLE users ADD COLUMN case_reset_at TEXT DEFAULT NULL;
+            END IF;
+
+            -- антиспам кейсов/казино
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='last_case_open')
+                THEN ALTER TABLE users ADD COLUMN last_case_open TEXT DEFAULT NULL;
+            END IF;
+
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='last_casino_play')
+                THEN ALTER TABLE users ADD COLUMN last_casino_play TEXT DEFAULT NULL;
+            END IF;
+        END $$;
+        """
+    )
 
     # Владение титулами/фонами (сроки)
     db_exec(
@@ -390,6 +463,19 @@ def init_db():
         """
     )
 
+    # ====== ВАЖНО: фиксим старые таблицы, если они были созданы без until/PK ======
+    migrate_add_column("ALTER TABLE user_titles ADD COLUMN IF NOT EXISTS until TEXT DEFAULT NULL")
+    migrate_add_column("ALTER TABLE user_themes ADD COLUMN IF NOT EXISTS until TEXT DEFAULT NULL")
+    # На всякий случай добавим уникальные индексы (если PRIMARY KEY почему-то не было)
+    try:
+        db_exec("CREATE UNIQUE INDEX IF NOT EXISTS user_titles_uq ON user_titles (user_id, title_code)")
+    except Exception:
+        pass
+    try:
+        db_exec("CREATE UNIQUE INDEX IF NOT EXISTS user_themes_uq ON user_themes (user_id, theme_code)")
+    except Exception:
+        pass
+
 def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
 
@@ -399,7 +485,8 @@ def ensure_user(user_id: int, username: Optional[str] = None):
         db_exec("UPDATE users SET username=%s WHERE id=%s", (username, user_id))
     # гарантируем Rookie в коллекции (навсегда)
     db_exec(
-        "INSERT INTO user_titles (user_id, title_code, until) VALUES (%s,%s,NULL) ON CONFLICT DO NOTHING",
+        "INSERT INTO user_titles (user_id, title_code, until) VALUES (%s,%s,NULL) "
+        "ON CONFLICT (user_id, title_code) DO NOTHING",
         (user_id, "ROOKIE"),
     )
 
@@ -426,8 +513,8 @@ def admin_menu():
             ["Забрать баланс", "Бан/Разбан"],
             ["⚙ Выдать лимит кликов", "🎖 Выдать привилегию"],
             ["🏷 Выдать титул", "🌌 Выдать фон"],
-            ["📚 Список названий", "Рассылка"],
-            ["📋 Заявки на вывод", "Все промокоды"],
+            ["📚 Список кодов", "📋 Заявки на вывод"],
+            ["Рассылка", "Все промокоды"],
             ["🔙 Назад"],
         ],
         resize_keyboard=True,
@@ -647,6 +734,7 @@ def parse_duration(value: str, unit: str) -> Optional[timedelta]:
         v = int(value)
     except Exception:
         return None
+
     u = (unit or "").strip().lower()
 
     if u in ("м", "мин", "минут", "минуты", "minute", "minutes", "min"):
@@ -672,29 +760,30 @@ def parse_duration(value: str, unit: str) -> Optional[timedelta]:
             return timedelta(days=int(raw[:-1]))
         except Exception:
             return None
+
     return None
 
 def is_infinity(s: str) -> bool:
     return s.strip().lower() in ("infinity", "inf", "♾️", "♾", "navsegda", "навсегда")
 
 def check_and_update_vip(user_id: int) -> Tuple[Optional[str], Optional[datetime]]:
-    row = db_fetchone("SELECT vip_type, vip_until FROM users WHERE id=%s", (user_id,))
+    row = db_fetchone("SELECT vip_type, vip_until, vip_base_limit FROM users WHERE id=%s", (user_id,))
     if not row:
         return None, None
 
-    vip_type, vip_until = row
+    vip_type, vip_until, vip_base_limit = row
     if not vip_type or not vip_until:
         return None, None
 
     try:
         until_dt = datetime.fromisoformat(vip_until)
     except Exception:
-        db_exec("UPDATE users SET vip_type=NULL, vip_until=NULL WHERE id=%s", (user_id,))
+        db_exec("UPDATE users SET vip_type=NULL, vip_until=NULL, vip_base_limit=NULL WHERE id=%s", (user_id,))
         return None, None
 
     now = datetime.now()
     if now >= until_dt:
-        db_exec("UPDATE users SET vip_type=NULL, vip_until=NULL WHERE id=%s", (user_id,))
+        db_exec("UPDATE users SET vip_type=NULL, vip_until=NULL, vip_base_limit=NULL WHERE id=%s", (user_id,))
         return None, None
 
     return vip_type, until_dt
@@ -725,7 +814,6 @@ def get_active_title(user_id: int) -> str:
     return code
 
 def vip_frame_icon(vip_type: Optional[str]) -> str:
-    # VIP рамка всегда главнее
     if vip_type == "VIP":
         return "💎"
     if vip_type == "MVP":
@@ -768,7 +856,8 @@ def ensure_progress_titles(user_id: int):
     for need, code in TITLE_PROGRESS:
         if tc >= need:
             db_exec(
-                "INSERT INTO user_titles (user_id, title_code, until) VALUES (%s,%s,NULL) ON CONFLICT DO NOTHING",
+                "INSERT INTO user_titles (user_id, title_code, until) VALUES (%s,%s,NULL) "
+                "ON CONFLICT (user_id, title_code) DO NOTHING",
                 (user_id, code),
             )
 
@@ -793,16 +882,14 @@ def check_click_reset(user_id: int) -> Tuple[int, datetime]:
     now = datetime.now()
 
     if not row or row[0] is None:
-        db_exec("UPDATE users SET last_click_reset=%s, clicks_used=0 WHERE id=%s",
-                (now.strftime("%Y-%m-%d %H:%M:%S"), user_id))
+        db_exec("UPDATE users SET last_click_reset=%s, clicks_used=0 WHERE id=%s", (now.strftime("%Y-%m-%d %H:%M:%S"), user_id))
         return 0, now + timedelta(hours=CLICK_RESET_HOURS)
 
     last_reset = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
     next_reset = last_reset + timedelta(hours=CLICK_RESET_HOURS)
 
     if now >= next_reset:
-        db_exec("UPDATE users SET last_click_reset=%s, clicks_used=0 WHERE id=%s",
-                (now.strftime("%Y-%m-%d %H:%M:%S"), user_id))
+        db_exec("UPDATE users SET last_click_reset=%s, clicks_used=0 WHERE id=%s", (now.strftime("%Y-%m-%d %H:%M:%S"), user_id))
         return 0, now + timedelta(hours=CLICK_RESET_HOURS)
 
     return int(row[1]), next_reset
@@ -811,18 +898,24 @@ def case_reset_if_needed(user_id: int):
     row = db_fetchone("SELECT case_reset_at FROM users WHERE id=%s", (user_id,))
     now = datetime.now()
     if not row or not row[0]:
-        db_exec("UPDATE users SET case_reset_at=%s, case_open_common=0, case_open_rare=0, case_open_legend=0 WHERE id=%s",
-                (now_iso(), user_id))
+        db_exec(
+            "UPDATE users SET case_reset_at=%s, case_open_common=0, case_open_rare=0, case_open_legend=0 WHERE id=%s",
+            (now_iso(), user_id),
+        )
         return
     try:
         last = datetime.fromisoformat(row[0])
     except Exception:
-        db_exec("UPDATE users SET case_reset_at=%s, case_open_common=0, case_open_rare=0, case_open_legend=0 WHERE id=%s",
-                (now_iso(), user_id))
+        db_exec(
+            "UPDATE users SET case_reset_at=%s, case_open_common=0, case_open_rare=0, case_open_legend=0 WHERE id=%s",
+            (now_iso(), user_id),
+        )
         return
     if now >= last + timedelta(hours=CASE_RESET_HOURS):
-        db_exec("UPDATE users SET case_reset_at=%s, case_open_common=0, case_open_rare=0, case_open_legend=0 WHERE id=%s",
-                (now_iso(), user_id))
+        db_exec(
+            "UPDATE users SET case_reset_at=%s, case_open_common=0, case_open_rare=0, case_open_legend=0 WHERE id=%s",
+            (now_iso(), user_id),
+        )
 
 def case_cooldown_left(user_id: int) -> int:
     row = db_fetchone("SELECT last_case_open FROM users WHERE id=%s", (user_id,))
@@ -880,8 +973,10 @@ def vip_apply_reward(user_id: int, vip_type: str, amount: int, unit: str) -> Tup
     else:
         new_until = now + dur
 
-    db_exec("UPDATE users SET vip_type=%s, vip_until=%s WHERE id=%s",
-            (vip_type, new_until.isoformat(), user_id))
+    db_exec(
+        "UPDATE users SET vip_type=%s, vip_until=%s WHERE id=%s",
+        (vip_type, new_until.isoformat(), user_id),
+    )
     return True, f"Вы получили VIP: {vip_type} на {amount} {unit} ✅"
 
 # =========================
@@ -951,6 +1046,7 @@ async def send_profile_message(chat, context: ContextTypes.DEFAULT_TYPE, user_id
     nick = f"[{title_name}] {user_link_html(user_id, stored_username)}"
     vip_status_text = vip_type if vip_type else "нет"
     vip_left_text = format_time_left(vip_until_dt - datetime.now()) if vip_until_dt else "нет VIP статуса"
+
     header = profile_header(vip_type, active_theme)
 
     text = (
@@ -974,76 +1070,13 @@ async def send_profile_message(chat, context: ContextTypes.DEFAULT_TYPE, user_id
     )
 
 # =========================
-# ===== REF BONUS MENU ====
-# =========================
-def ref_bonuses_inline_menu(ref_count: int, claimed10: int, claimed50: int, claimed100: int):
-    buttons = []
-    if claimed10:
-        buttons.append([InlineKeyboardButton("✅ 10 рефов — получено", callback_data="noop")])
-    else:
-        buttons.append([InlineKeyboardButton("🎁 Забрать за 10 рефов", callback_data="claim_ref_10")])
-    if claimed50:
-        buttons.append([InlineKeyboardButton("✅ 50 рефов — получено", callback_data="noop")])
-    else:
-        buttons.append([InlineKeyboardButton("🎁 Забрать за 50 рефов", callback_data="claim_ref_50")])
-    if claimed100:
-        buttons.append([InlineKeyboardButton("✅ 100 рефов — получено", callback_data="noop")])
-    else:
-        buttons.append([InlineKeyboardButton("🎁 Забрать за 100 рефов", callback_data="claim_ref_100")])
-
-    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_profile")])
-    return InlineKeyboardMarkup(buttons)
-
-async def send_ref_bonus_menu(q, context, user_id: int):
-    ref_count = get_subscribed_ref_count(user_id)
-    row = db_fetchone("SELECT ref_bonus_10, ref_bonus_50, ref_bonus_100 FROM users WHERE id=%s", (user_id,))
-    claimed10, claimed50, claimed100 = row if row else (0, 0, 0)
-    text = (
-        "🎯 Бонусы за рефералов\n\n"
-        f"👥 Подписанные рефералы: {ref_count}\n\n"
-        "Награды:\n"
-        "• 10 рефов → +1000G\n"
-        "• 50 рефов → +5000G\n"
-        "• 100 рефов → +10000G\n\n"
-        "Нажми кнопку, чтобы забрать (если выполнено)."
-    )
-    await q.message.reply_text(
-        text,
-        reply_markup=ref_bonuses_inline_menu(ref_count, claimed10, claimed50, claimed100),
-    )
-
-async def process_claim_ref_bonus(q, context, user_id: int, data: str):
-    ref_count = get_subscribed_ref_count(user_id)
-    if data == "claim_ref_10":
-        need, reward, col = 10, 1000, "ref_bonus_10"
-    elif data == "claim_ref_50":
-        need, reward, col = 50, 5000, "ref_bonus_50"
-    elif data == "claim_ref_100":
-        need, reward, col = 100, 10000, "ref_bonus_100"
-    else:
-        return
-
-    row = db_fetchone(f"SELECT {col} FROM users WHERE id=%s", (user_id,))
-    already = int(row[0]) if row else 0
-    if already:
-        await q.message.reply_text("✅ Ты уже забрал эту награду.")
-        return
-
-    if ref_count < need:
-        await q.message.reply_text(f"❌ Нужно {need} подписанных рефералов. Сейчас: {ref_count}")
-        return
-
-    db_exec(f"UPDATE users SET balance=balance+%s, {col}=1 WHERE id=%s", (reward, user_id))
-    await q.message.reply_text(f"🎉 Награда получена: +{reward} GOLD ✅")
-    await send_ref_bonus_menu(q, context, user_id)
-
-# =========================
 # ===== INLINE HANDLER =====
 # =========================
 async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
         return
+
     try:
         await q.answer()
     except Exception:
@@ -1133,11 +1166,15 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         ok, left = can_take_daily(last_daily)
         if not ok and left is not None:
-            await q.message.reply_text(f"⏳ Ежедневный бонус уже был.\nСледующий через: {format_time_left(left)}")
+            await q.message.reply_text(
+                f"⏳ Ежедневный бонус уже был.\nСледующий через: {format_time_left(left)}",
+            )
             return
 
-        db_exec("UPDATE users SET balance=balance+%s, last_daily_bonus=%s WHERE id=%s",
-                (DAILY_BONUS_AMOUNT, now_iso(), user_id))
+        db_exec(
+            "UPDATE users SET balance=balance+%s, last_daily_bonus=%s WHERE id=%s",
+            (DAILY_BONUS_AMOUNT, now_iso(), user_id),
+        )
         await q.message.reply_text(f"✅ Ежедневный бонус получен: +{DAILY_BONUS_AMOUNT} GOLD 🎁")
         return
 
@@ -1145,6 +1182,7 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "ref_bonuses":
         await send_ref_bonus_menu(q, context, user_id)
         return
+
     if data.startswith("claim_ref_"):
         await process_claim_ref_bonus(q, context, user_id, data)
         return
@@ -1180,7 +1218,7 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("case_buy_"):
-        kind = data.split("_")[-1]
+        kind = data.split("_")[-1]  # common/rare/legend
         price = CASE_PRICES.get(kind, None)
         if price is None:
             return
@@ -1194,14 +1232,13 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         col = "cases_common" if kind == "common" else ("cases_rare" if kind == "rare" else "cases_legend")
         db_exec(f"UPDATE users SET balance=balance-%s, {col}={col}+1 WHERE id=%s", (price, user_id))
         await q.message.reply_text(f"✅ Куплено: {kind.upper()} кейс (+1).")
-
         row2 = db_fetchone("SELECT cases_common, cases_rare, cases_legend FROM users WHERE id=%s", (user_id,))
         c, r, l = row2 if row2 else (0, 0, 0)
         await q.message.reply_text("📦 Кейсы:", reply_markup=cases_inline_menu(c, r, l))
         return
 
     if data.startswith("case_open_"):
-        kind = data.split("_")[-1]
+        kind = data.split("_")[-1]  # common/rare/legend
 
         left_cd = case_cooldown_left(user_id)
         if left_cd > 0:
@@ -1230,10 +1267,15 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     reset_at = None
             left = (reset_at - datetime.now()) if reset_at else timedelta(hours=CASE_RESET_HOURS)
-            await q.message.reply_text(f"❌ Лимит кейсов исчерпан ({limit}/{limit}).\nСледующий сброс через: {format_time_left(left)}")
+            await q.message.reply_text(
+                f"❌ Лимит кейсов исчерпан ({limit}/{limit}).\nСледующий сброс через: {format_time_left(left)}"
+            )
             return
 
-        db_exec(f"UPDATE users SET {inv_col}={inv_col}-1, {open_col}={open_col}+1 WHERE id=%s", (user_id,))
+        db_exec(
+            f"UPDATE users SET {inv_col}={inv_col}-1, {open_col}={open_col}+1 WHERE id=%s",
+            (user_id,),
+        )
         set_case_touch(user_id)
 
         m = await q.message.reply_text("📦 Открываю кейс…")
@@ -1256,11 +1298,11 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text(f"🎉 Выпало: +{amount} GOLD ✅")
         else:
             vip_type, amt, unit = drop_value
-            ok, text = vip_apply_reward(user_id, vip_type, int(amt), unit)
+            ok, text_ = vip_apply_reward(user_id, vip_type, int(amt), unit)
             if ok:
-                await q.message.reply_text(f"🎉 Выпало: {vip_type} ✅\n{text}")
+                await q.message.reply_text(f"🎉 Выпало: {vip_type} ✅\n{text_}")
             else:
-                await q.message.reply_text(f"🎉 Выпало: {vip_type}\n{text}")
+                await q.message.reply_text(f"🎉 Выпало: {vip_type}\n{text_}")
 
         row2 = db_fetchone("SELECT cases_common, cases_rare, cases_legend FROM users WHERE id=%s", (user_id,))
         c, r, l = row2 if row2 else (0, 0, 0)
@@ -1341,8 +1383,11 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         db_exec("UPDATE users SET balance=balance-%s WHERE id=%s", (price, user_id))
-        db_exec("INSERT INTO user_themes (user_id, theme_code, until) VALUES (%s,%s,NULL) ON CONFLICT DO NOTHING",
-                (user_id, code))
+        db_exec(
+            "INSERT INTO user_themes (user_id, theme_code, until) VALUES (%s,%s,NULL) "
+            "ON CONFLICT (user_id, theme_code) DO NOTHING",
+            (user_id, code),
+        )
         await q.message.reply_text("✅ Фон куплен.")
         return
 
@@ -1471,6 +1516,7 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         db_exec("UPDATE users SET balance=balance-%s WHERE id=%s", (bet, user_id))
+
         set_casino_touch(user_id)
         context.user_data["casino_step"] = "rolling"
 
@@ -1490,14 +1536,23 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if game == "bigsmall":
             is_big = value >= 4
-            win = (pick == "big" and is_big) or (pick == "small" and not is_big)
+            if pick == "big" and is_big:
+                win = True
+            if pick == "small" and not is_big:
+                win = True
             result_text = f"Выпало: {value} ({'Больше' if is_big else 'Меньше'})"
+
         elif game == "evenodd":
             is_even = (value % 2 == 0)
-            win = (pick == "even" and is_even) or (pick == "odd" and not is_even)
+            if pick == "even" and is_even:
+                win = True
+            if pick == "odd" and not is_even:
+                win = True
             result_text = f"Выпало: {value} ({'Чёт' if is_even else 'Нечёт'})"
+
         else:
-            win = (pick.isdigit() and int(pick) == value)
+            if pick.isdigit() and int(pick) == value:
+                win = True
             result_text = f"Выпало: {value}"
 
         coef = CASINO_COEF[game]
@@ -1524,7 +1579,64 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 # =========================
-# ===== ADMIN withdraw done/cancel
+# ===== REF BONUS MENU ====
+# =========================
+def ref_bonuses_inline_menu(ref_count: int, claimed10: int, claimed50: int, claimed100: int):
+    buttons = []
+    buttons.append([InlineKeyboardButton("✅ 10 рефов — получено", callback_data="noop")]) if claimed10 else buttons.append(
+        [InlineKeyboardButton("🎁 Забрать за 10 рефов", callback_data="claim_ref_10")]
+    )
+    buttons.append([InlineKeyboardButton("✅ 50 рефов — получено", callback_data="noop")]) if claimed50 else buttons.append(
+        [InlineKeyboardButton("🎁 Забрать за 50 рефов", callback_data="claim_ref_50")]
+    )
+    buttons.append([InlineKeyboardButton("✅ 100 рефов — получено", callback_data="noop")]) if claimed100 else buttons.append(
+        [InlineKeyboardButton("🎁 Забрать за 100 рефов", callback_data="claim_ref_100")]
+    )
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_profile")])
+    return InlineKeyboardMarkup(buttons)
+
+async def send_ref_bonus_menu(q, context, user_id: int):
+    ref_count = get_subscribed_ref_count(user_id)
+    row = db_fetchone("SELECT ref_bonus_10, ref_bonus_50, ref_bonus_100 FROM users WHERE id=%s", (user_id,))
+    claimed10, claimed50, claimed100 = row if row else (0, 0, 0)
+    text = (
+        "🎯 Бонусы за рефералов\n\n"
+        f"👥 Подписанные рефералы: {ref_count}\n\n"
+        "Награды:\n"
+        "• 10 рефов → +1000G\n"
+        "• 50 рефов → +5000G\n"
+        "• 100 рефов → +10000G\n\n"
+        "Нажми кнопку, чтобы забрать (если выполнено)."
+    )
+    await q.message.reply_text(text, reply_markup=ref_bonuses_inline_menu(ref_count, claimed10, claimed50, claimed100))
+
+async def process_claim_ref_bonus(q, context, user_id: int, data: str):
+    ref_count = get_subscribed_ref_count(user_id)
+    if data == "claim_ref_10":
+        need, reward, col = 10, 1000, "ref_bonus_10"
+    elif data == "claim_ref_50":
+        need, reward, col = 50, 5000, "ref_bonus_50"
+    elif data == "claim_ref_100":
+        need, reward, col = 100, 10000, "ref_bonus_100"
+    else:
+        return
+
+    row = db_fetchone(f"SELECT {col} FROM users WHERE id=%s", (user_id,))
+    already = int(row[0]) if row else 0
+    if already:
+        await q.message.reply_text("✅ Ты уже забрал эту награду.")
+        return
+
+    if ref_count < need:
+        await q.message.reply_text(f"❌ Нужно {need} подписанных рефералов. Сейчас: {ref_count}")
+        return
+
+    db_exec(f"UPDATE users SET balance=balance+%s, {col}=1 WHERE id=%s", (reward, user_id))
+    await q.message.reply_text(f"🎉 Награда получена: +{reward} GOLD ✅")
+    await send_ref_bonus_menu(q, context, user_id)
+
+# =========================
+# ===== WITHDRAW done/cancel
 # =========================
 async def admin_process_withdraw_decision(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     lower = text.strip().lower()
@@ -1557,8 +1669,10 @@ async def admin_process_withdraw_decision(update: Update, context: ContextTypes.
     decided_at = now_iso()
 
     if cmd == "done":
-        db_exec("UPDATE withdrawals SET status='approved', admin_note=%s, decided_at=%s WHERE id=%s",
-                (admin_note, decided_at, wid))
+        db_exec(
+            "UPDATE withdrawals SET status='approved', admin_note=%s, decided_at=%s WHERE id=%s",
+            (admin_note, decided_at, wid),
+        )
         try:
             msg_user = (
                 "✅ Ваша заявка на вывод подтверждена\n"
@@ -1575,8 +1689,10 @@ async def admin_process_withdraw_decision(update: Update, context: ContextTypes.
 
     if cmd == "cancel":
         db_exec("UPDATE users SET balance=balance+%s WHERE id=%s", (amount, target_uid))
-        db_exec("UPDATE withdrawals SET status='declined', admin_note=%s, decided_at=%s WHERE id=%s",
-                (admin_note, decided_at, wid))
+        db_exec(
+            "UPDATE withdrawals SET status='declined', admin_note=%s, decided_at=%s WHERE id=%s",
+            (admin_note, decided_at, wid),
+        )
         try:
             msg_user = (
                 "❌ Ваша заявка на вывод отклонена\n"
@@ -1592,6 +1708,22 @@ async def admin_process_withdraw_decision(update: Update, context: ContextTypes.
         return True
 
     return False
+
+def format_codes_list() -> str:
+    # список кодов для админа
+    t_lines = ["🏷 TITLES (TITLE_CODE → название):"]
+    for code, name in sorted(TITLE_NAMES.items()):
+        t_lines.append(f"• {code} → {name}")
+
+    th_lines = ["\n🌌 THEMES (THEME_CODE → название/цена):"]
+    for code, name in THEME_NAMES.items():
+        th_lines.append(f"• {code} → {name} ({THEME_PRICES.get(code, 0)}G)")
+
+    v_lines = ["\n🎖 VIP (тип → лимит):"]
+    for k, v in VIP_LIMITS.items():
+        v_lines.append(f"• {k} → {v}")
+
+    return "\n".join(t_lines + th_lines + v_lines)
 
 # =========================
 # ===== ОБРАБОТКА TEXT =====
@@ -1724,7 +1856,10 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 db_exec("UPDATE users SET balance=balance+%s WHERE id=%s", (amount, user_id))
                 db_exec("UPDATE promocodes SET uses_left=uses_left-1 WHERE code=%s", (code,))
-                db_exec("INSERT INTO used_promocodes (user_id, code) VALUES (%s,%s) ON CONFLICT DO NOTHING", (user_id, code))
+                db_exec(
+                    "INSERT INTO used_promocodes (user_id, code) VALUES (%s,%s) ON CONFLICT DO NOTHING",
+                    (user_id, code),
+                )
                 await safe_reply(update, f"🎉 ПРОМО АКТИВИРОВАН\n💰 +{amount} GOLD", reply_markup=main_menu(user_id))
         context.user_data.clear()
         return
@@ -1768,8 +1903,10 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount = float(context.user_data.get("withdraw_amount", 0))
         requisites = text.strip()
 
-        db_exec("INSERT INTO withdrawals (user_id, amount, requisites, status) VALUES (%s,%s,%s,'pending')",
-                (user_id, amount, requisites))
+        db_exec(
+            "INSERT INTO withdrawals (user_id, amount, requisites, status) VALUES (%s,%s,%s,'pending')",
+            (user_id, amount, requisites),
+        )
         db_exec("UPDATE users SET balance=balance-%s WHERE id=%s", (amount, user_id))
 
         await safe_reply(
@@ -1840,20 +1977,11 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if handled:
             return
 
-    if is_admin(user_id) and text == "📚 Список названий":
-        titles = "\n".join([f"{k} = {v}" for k, v in sorted(TITLE_NAMES.items())])
-        themes = "\n".join([f"{k} = {v} ({THEME_PRICES.get(k, '-') }G)" for k, v in THEME_NAMES.items()])
-        vip = "VIP / MVP / PREMIUM"
-        msg = (
-            "📚 Список названий\n\n"
-            f"🎖 VIP:\n{vip}\n\n"
-            f"🏷 TITLE_CODE:\n{titles}\n\n"
-            f"🌌 THEME_CODE:\n{themes}"
-        )
-        await safe_reply(update, msg, reply_markup=admin_menu())
-        return
-
     if is_admin(user_id) and menu == "admin" and admin_action is None:
+        if text == "📚 Список кодов":
+            await safe_reply(update, format_codes_list(), reply_markup=admin_menu())
+            return
+
         if text == "Создать промокод":
             context.user_data["admin_action"] = "create_promocode"
             await safe_reply(update, "Код Сумма Кол-во\nПример: KISS 10 5", reply_markup=cancel_menu())
@@ -1997,8 +2125,7 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 if is_infinity(parts[2]):
                     ensure_user(uid)
-                    db_exec("UPDATE users SET vip_type=%s, vip_until=%s WHERE id=%s",
-                            (vip, "9999-12-31T23:59:59", uid))
+                    db_exec("UPDATE users SET vip_type=%s, vip_until=%s WHERE id=%s", (vip, "9999-12-31T23:59:59", uid))
                     await safe_reply(update, f"✅ VIP выдан {uid}: {vip} (Infinity)", reply_markup=admin_menu())
                     return
 
@@ -2019,7 +2146,6 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     until = until_dt + dur
                 else:
                     until = now + dur
-
                 db_exec("UPDATE users SET vip_type=%s, vip_until=%s WHERE id=%s", (vip, until.isoformat(), uid))
                 await safe_reply(update, f"✅ VIP выдан {uid}: {vip} ({value} {unit})", reply_markup=admin_menu())
 
@@ -2030,7 +2156,7 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 uid = int(parts[0])
                 code = parts[1].upper()
                 if code not in TITLE_NAMES:
-                    await safe_reply(update, "❌ Неизвестный TITLE_CODE (смотри 📚 Список названий)", reply_markup=cancel_menu())
+                    await safe_reply(update, "❌ Неизвестный TITLE_CODE", reply_markup=cancel_menu())
                     return
                 ensure_user(uid)
 
@@ -2065,7 +2191,7 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 uid = int(parts[0])
                 code = parts[1].upper()
                 if code not in THEME_NAMES:
-                    await safe_reply(update, "❌ Неизвестный THEME_CODE (смотри 📚 Список названий)", reply_markup=cancel_menu())
+                    await safe_reply(update, "❌ Неизвестный THEME_CODE", reply_markup=cancel_menu())
                     return
                 ensure_user(uid)
 
@@ -2094,7 +2220,7 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await safe_reply(update, f"✅ Фон выдан: {uid} -> {code} до {until.strftime('%d.%m.%Y %H:%M')}", reply_markup=admin_menu())
 
             elif admin_action == "broadcast":
-                msg = text
+                msg = " ".join(parts) if parts else text
                 users = db_fetchall("SELECT id FROM users")
                 sent = 0
                 for (uid,) in users:
@@ -2120,7 +2246,7 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
     if isinstance(err, Conflict):
-        logger.warning("Conflict: запущено 2 getUpdates. Бот может молчать пока конфликт не исчезнет.")
+        logger.warning("Conflict: запущено 2 getUpdates. Бот будет молчать пока не останется 1 инстанс.")
         return
     logger.exception("Unhandled error:", exc_info=err)
 
@@ -2137,6 +2263,7 @@ def main():
     init_db()
 
     app = ApplicationBuilder().token(TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(inline_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handler))
