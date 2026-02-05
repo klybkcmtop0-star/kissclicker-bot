@@ -312,16 +312,22 @@ def init_db():
         )
         """
     )
-
+    
     db_exec(
         """
-        CREATE TABLE IF NOT EXISTS referrals (
-            user_id BIGINT PRIMARY KEY,
-            referrer_id BIGINT,
-            rewarded INTEGER DEFAULT 0
+        CREATE TABLE IF NOT EXISTS users (
+            id BIGINT PRIMARY KEY,
+            balance DOUBLE PRECISION DEFAULT 0,
+            ...
         )
         """
     )
+
+    # 🔧 МИГРАЦИЯ: upgrade_level
+    try:
+        db_exec("ALTER TABLE users ADD COLUMN upgrade_level INTEGER DEFAULT 0")
+    except Exception:
+        pass
 
     db_exec(
         """
@@ -2193,4 +2199,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
