@@ -637,23 +637,51 @@ def compute_click_reward(user_id: int) -> int:
     lvl = int(row[0] or 0) if row else 0
     return click_reward_for_level(lvl)
 
-def check_click_reset(user_id: int) -> Tuple[int, datetime, int]:
-    row = db_fetchone("SELECT last_click_reset, clicks_used FROM users WHERE id=%s", (user_id,))
+def check_click_reset(user_id: int):
+    row = db_fetchone(
+        "SELECT last_click_reset, clicks_used, clicks_limit FROM users WHERE id=%s",
+        (user_id,),
+    )
     now = datetime.now()
-    limit = compute_current_limit(user_id)
 
+    # если юзер новый / поле пустое
     if not row or row[0] is None:
-        db_exec("UPDATE users SET last_click_reset=%s, clicks_used=0 WHERE id=%s", (now.strftime("%Y-%m-%d %H:%M:%S"), user_id))
-        return 0, now + timedelta(hours=CLICK_RESET_HOURS), limit
+        db_exec(
+            "UPDATE users SET last_click_reset=%s, clicks_used=0 WHERE id=%s",
+            (now.strftime("%Y-%m-%d %H:%M:%S"), user_id),
+        )
+        return 0, now + timedelta(hours=CLICK_RESET_HOURS), DEFAULT_CLICKS_LIMIT
 
-    last_reset = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
+    raw = str(row[0])
+    clicks_used = int(row[1] or 0)
+    clicks_limit = int(row[2] or DEFAULT_CLICKS_LIMIT)
+
+    # 🔥 безопасный парс даты (если в БД старый формат с 'T' — не ломаемся)
+    try:
+        # твой текущий формат
+        last_reset = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        try:
+            # ISO формат: 2026-02-05T12:34:56
+            last_reset = datetime.fromisoformat(raw)
+        except Exception:
+            # вообще мусор — просто сбросим
+            db_exec(
+                "UPDATE users SET last_click_reset=%s, clicks_used=0 WHERE id=%s",
+                (now.strftime("%Y-%m-%d %H:%M:%S"), user_id),
+            )
+            return 0, now + timedelta(hours=CLICK_RESET_HOURS), clicks_limit
+
     next_reset = last_reset + timedelta(hours=CLICK_RESET_HOURS)
-    if now >= next_reset:
-        db_exec("UPDATE users SET last_click_reset=%s, clicks_used=0 WHERE id=%s", (now.strftime("%Y-%m-%d %H:%M:%S"), user_id))
-        return 0, now + timedelta(hours=CLICK_RESET_HOURS), limit
 
-    used = int(row[1] or 0)
-    return used, next_reset, limit
+    if now >= next_reset:
+        db_exec(
+            "UPDATE users SET last_click_reset=%s, clicks_used=0 WHERE id=%s",
+            (now.strftime("%Y-%m-%d %H:%M:%S"), user_id),
+        )
+        return 0, now + timedelta(hours=CLICK_RESET_HOURS), clicks_limit
+
+    return clicks_used, next_reset, clicks_limit
 
 # =========================
 # ===== ВЫВОД НИКА / ТОПЫ ==
@@ -2165,3 +2193,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
