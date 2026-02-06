@@ -200,9 +200,9 @@ CASINO_COOLDOWN_SEC = 5
 CASINO_MIN_BET = 100
 CASINO_MAX_BET = 500000
 CASINO_COEF = {
-    "bigsmall": 1.8,
-    "evenodd": 1.8,
-    "number": 2.5,
+    "bigsmall": 1.5,
+    "evenodd": 1.5,
+    "number": 2.2,
 }
 
 # =========================
@@ -2274,4 +2274,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
