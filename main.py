@@ -5,7 +5,7 @@ import asyncio
 import random
 import html
 from datetime import datetime, timedelta
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import psycopg2
 from telegram import (
@@ -31,9 +31,7 @@ from telegram.ext import (
 TOKEN = os.getenv("TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")  # Railway -> Variables -> DATABASE_URL
 
-# Можно несколько админов:
 ADMIN_IDS = {1924971257}  # добавляй через запятую: {192..., 503...}
-
 CHANNEL_ID = "@kisspromochannel"
 
 # Экономика
@@ -49,7 +47,6 @@ DAILY_BONUS_HOURS = 24
 
 # VIP
 VIP_LIMITS = {"VIP": 2500, "MVP": 3500, "PREMIUM": 4500}
-VIP_ICONS = {"VIP": "🏆", "MVP": "💎", "PREMIUM": "💲"}
 VIP_RANK = {"VIP": 1, "MVP": 2, "PREMIUM": 3}
 
 # Косметика: титулы
@@ -69,15 +66,11 @@ TITLE_NAMES = {
     "STINGER": "Stinger",
     "DEV": "DEV",
     "OWNER": "OWNER",
-
-    # новые титулы
     "GOD": "God",
     "HACKER": "Hacker",
     "BETA_CREATOR": "Beta Creator",
     "GOJO": "GOJO",
     "CREATOR": "Creator",
-
-    # прогресс-титулы:
     "MASTER_CLICK": "Master Click",
     "ELITE_CLICKER": "Elite Clicker",
     "ULTRA_CLICKER": "Ultra Clicker",
@@ -125,29 +118,12 @@ COSMETIC_CHANGE_COOLDOWN_SEC = 10
 # Улучшения (0..10)
 UPGRADE_MAX = 10
 UPGRADE_BONUS_CLICKS = {
-    0: 0,
-    1: 200,
-    2: 250,
-    3: 300,
-    4: 350,
-    5: 400,
-    6: 450,
-    7: 500,
-    8: 600,
-    9: 800,
-    10: 1000,
+    0: 0, 1: 200, 2: 250, 3: 300, 4: 350,
+    5: 400, 6: 450, 7: 500, 8: 600, 9: 800, 10: 1000,
 }
 UPGRADE_PRICES = {
-    0: 3500,   # 0->1
-    1: 5000,   # 1->2
-    2: 7000,   # 2->3
-    3: 9000,   # 3->4
-    4: 12000,  # 4->5
-    5: 14500,  # 5->6
-    6: 17000,  # 6->7
-    7: 19500,  # 7->8
-    8: 22000,  # 8->9
-    9: 25000,  # 9->10
+    0: 3500, 1: 5000, 2: 7000, 3: 9000, 4: 12000,
+    5: 14500, 6: 17000, 7: 19500, 8: 22000, 9: 25000,
 }
 
 def click_reward_by_level(lvl: int) -> int:
@@ -161,10 +137,8 @@ def click_reward_by_level(lvl: int) -> int:
 CASE_PRICES = {"common": 500, "rare": 1000, "legend": 3000}
 CASE_LIMITS_12H = {"common": 7, "rare": 4, "legend": 2}
 CASE_RESET_HOURS = 12
-CASE_OPEN_COOLDOWN_SEC = 8  # “интрига” 7–10 сек
+CASE_OPEN_COOLDOWN_SEC = 8  # “интрига”
 
-# Подкрученный дроп (вариант C)
-# ВАЖНО: суммы/шансы ровно 100%
 CASE_DROPS = {
     "common": [
         ("GOLD", 100, 45),
@@ -204,6 +178,15 @@ CASINO_COEF = {
     "evenodd": 1.5,
     "number": 2.2,
 }
+
+# =========================
+# ===== АНТИСПАМ / АНТИКЛИК
+# =========================
+CLICK_MIN_INTERVAL_SEC = 0.55
+
+HUMAN_CHECK_K = 12         # окно K
+HUMAN_CHECK_EPS = 0.07     # порог ровности (сек)
+HUMAN_CHECK_TRIGGER = 40   # после N "ровных" кликов — проверка
 
 # =========================
 # ===== ЛОГИ ==============
@@ -266,13 +249,13 @@ def db_fetchall(query: str, params: tuple = ()):
         return cur.fetchall()
 
 def migrate_add_column(sql: str):
-    # безопасно пытаемся выполнить ALTER, даже если старая схема/права/и т.д.
     try:
         db_exec(sql)
     except Exception as e:
         logger.warning(f"Migration skipped/failed: {e}")
 
 def init_db():
+    # базовые таблицы
     db_exec(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -328,118 +311,47 @@ def init_db():
         """
     )
 
-    # Косметика/улучшения/кейсы
-    db_exec(
-        """
-        DO $$
-        BEGIN
-            -- VIP
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='vip_type')
-                THEN ALTER TABLE users ADD COLUMN vip_type TEXT DEFAULT NULL;
-            END IF;
+    # ====== БЕЗ DO $$ : безопасные ALTER TABLE ... IF NOT EXISTS ======
+    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS vip_type TEXT DEFAULT NULL")
+    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS vip_until TEXT DEFAULT NULL")
+    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS vip_base_limit INTEGER DEFAULT NULL")
 
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='vip_until')
-                THEN ALTER TABLE users ADD COLUMN vip_until TEXT DEFAULT NULL;
-            END IF;
+    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS total_clicks BIGINT DEFAULT 0")
+    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT DEFAULT NULL")
+    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_daily_bonus TEXT DEFAULT NULL")
 
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='vip_base_limit')
-                THEN ALTER TABLE users ADD COLUMN vip_base_limit INTEGER DEFAULT NULL;
-            END IF;
+    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS ref_bonus_10 INTEGER DEFAULT 0")
+    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS ref_bonus_50 INTEGER DEFAULT 0")
+    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS ref_bonus_100 INTEGER DEFAULT 0")
 
-            -- total clicks
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='total_clicks')
-                THEN ALTER TABLE users ADD COLUMN total_clicks BIGINT DEFAULT 0;
-            END IF;
+    migrate_add_column("ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS admin_note TEXT DEFAULT NULL")
+    migrate_add_column("ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS decided_at TEXT DEFAULT NULL")
 
-            -- username для топов
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='username')
-                THEN ALTER TABLE users ADD COLUMN username TEXT DEFAULT NULL;
-            END IF;
+    migrate_add_column(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS base_click_limit INTEGER DEFAULT {BASE_CLICK_LIMIT_DEFAULT}")
+    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS upgrade_level INTEGER DEFAULT 0")
 
-            -- ежедневный бонус
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='last_daily_bonus')
-                THEN ALTER TABLE users ADD COLUMN last_daily_bonus TEXT DEFAULT NULL;
-            END IF;
+    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS active_title TEXT DEFAULT 'ROOKIE'")
+    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS active_theme TEXT DEFAULT NULL")
+    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_cosmetic_change TEXT DEFAULT NULL")
 
-            -- бонусы за рефералов
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='ref_bonus_10')
-                THEN ALTER TABLE users ADD COLUMN ref_bonus_10 INTEGER DEFAULT 0;
-            END IF;
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='ref_bonus_50')
-                THEN ALTER TABLE users ADD COLUMN ref_bonus_50 INTEGER DEFAULT 0;
-            END IF;
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='ref_bonus_100')
-                THEN ALTER TABLE users ADD COLUMN ref_bonus_100 INTEGER DEFAULT 0;
-            END IF;
+    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS cases_common INTEGER DEFAULT 0")
+    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS cases_rare INTEGER DEFAULT 0")
+    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS cases_legend INTEGER DEFAULT 0")
 
-            -- withdrawals admin fields
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='withdrawals' AND column_name='admin_note')
-                THEN ALTER TABLE withdrawals ADD COLUMN admin_note TEXT DEFAULT NULL;
-            END IF;
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='withdrawals' AND column_name='decided_at')
-                THEN ALTER TABLE withdrawals ADD COLUMN decided_at TEXT DEFAULT NULL;
-            END IF;
+    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS case_open_common INTEGER DEFAULT 0")
+    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS case_open_rare INTEGER DEFAULT 0")
+    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS case_open_legend INTEGER DEFAULT 0")
+    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS case_reset_at TEXT DEFAULT NULL")
 
-            -- базовый лимит кликов
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='base_click_limit')
-                THEN ALTER TABLE users ADD COLUMN base_click_limit INTEGER DEFAULT 2000;
-            END IF;
+    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_case_open TEXT DEFAULT NULL")
+    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_casino_play TEXT DEFAULT NULL")
 
-            -- уровень улучшений
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='upgrade_level')
-                THEN ALTER TABLE users ADD COLUMN upgrade_level INTEGER DEFAULT 0;
-            END IF;
-
-            -- активный титул/фон
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='active_title')
-                THEN ALTER TABLE users ADD COLUMN active_title TEXT DEFAULT 'ROOKIE';
-            END IF;
-
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='active_theme')
-                THEN ALTER TABLE users ADD COLUMN active_theme TEXT DEFAULT NULL;
-            END IF;
-
-            -- антиспам смены косметики
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='last_cosmetic_change')
-                THEN ALTER TABLE users ADD COLUMN last_cosmetic_change TEXT DEFAULT NULL;
-            END IF;
-
-            -- инвентарь кейсов
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='cases_common')
-                THEN ALTER TABLE users ADD COLUMN cases_common INTEGER DEFAULT 0;
-            END IF;
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='cases_rare')
-                THEN ALTER TABLE users ADD COLUMN cases_rare INTEGER DEFAULT 0;
-            END IF;
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='cases_legend')
-                THEN ALTER TABLE users ADD COLUMN cases_legend INTEGER DEFAULT 0;
-            END IF;
-
-            -- лимиты открытий кейсов за 12ч
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='case_open_common')
-                THEN ALTER TABLE users ADD COLUMN case_open_common INTEGER DEFAULT 0;
-            END IF;
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='case_open_rare')
-                THEN ALTER TABLE users ADD COLUMN case_open_rare INTEGER DEFAULT 0;
-            END IF;
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='case_open_legend')
-                THEN ALTER TABLE users ADD COLUMN case_open_legend INTEGER DEFAULT 0;
-            END IF;
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='case_reset_at')
-                THEN ALTER TABLE users ADD COLUMN case_reset_at TEXT DEFAULT NULL;
-            END IF;
-
-            -- антиспам кейсов/казино
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='last_case_open')
-                THEN ALTER TABLE users ADD COLUMN last_case_open TEXT DEFAULT NULL;
-            END IF;
-
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='last_casino_play')
-                THEN ALTER TABLE users ADD COLUMN last_casino_play TEXT DEFAULT NULL;
-            END IF;
-        END $$;
-        """
-    )
+    # ====== АНТИСПАМ/АНТИКЛИКЕР: колонки ======
+    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_click_at TEXT DEFAULT NULL")
+    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS click_intv_buf TEXT DEFAULT NULL")          # CSV float
+    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS suspicious_clicks INTEGER DEFAULT 0")      # счётчик
+    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS human_lock INTEGER DEFAULT 0")             # 1 = заблокирован до подтверждения
+    migrate_add_column("ALTER TABLE users ADD COLUMN IF NOT EXISTS human_lock_sent_at TEXT DEFAULT NULL")     # чтобы не спамить сообщениями
 
     # Владение титулами/фонами (сроки)
     db_exec(
@@ -463,10 +375,9 @@ def init_db():
         """
     )
 
-    # ====== ВАЖНО: фиксим старые таблицы, если они были созданы без until/PK ======
+    # фиксы старых схем
     migrate_add_column("ALTER TABLE user_titles ADD COLUMN IF NOT EXISTS until TEXT DEFAULT NULL")
     migrate_add_column("ALTER TABLE user_themes ADD COLUMN IF NOT EXISTS until TEXT DEFAULT NULL")
-    # На всякий случай добавим уникальные индексы (если PRIMARY KEY почему-то не было)
     try:
         db_exec("CREATE UNIQUE INDEX IF NOT EXISTS user_titles_uq ON user_titles (user_id, title_code)")
     except Exception:
@@ -476,23 +387,12 @@ def init_db():
     except Exception:
         pass
 
-def is_admin(uid: int) -> bool:
-    return uid in ADMIN_IDS
-
-def ensure_user(user_id: int, username: Optional[str] = None):
-    db_exec("INSERT INTO users (id) VALUES (%s) ON CONFLICT (id) DO NOTHING", (user_id,))
-    if username is not None:
-        db_exec("UPDATE users SET username=%s WHERE id=%s", (username, user_id))
-    # гарантируем Rookie в коллекции (навсегда)
-    db_exec(
-        "INSERT INTO user_titles (user_id, title_code, until) VALUES (%s,%s,NULL) "
-        "ON CONFLICT (user_id, title_code) DO NOTHING",
-        (user_id, "ROOKIE"),
-    )
-
 # =========================
 # ===== МЕНЮ ==============
 # =========================
+def is_admin(uid: int) -> bool:
+    return uid in ADMIN_IDS
+
 def main_menu(user_id: int):
     buttons = [
         ["👤 Профиль", "💰 Заработать"],
@@ -664,6 +564,63 @@ def casino_choice_menu(game: str):
         ]
     )
 
+def human_check_markup():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Я ЧЕЛОВЕК", callback_data="human_ok")]])
+
+# =========================
+# ===== СТИЛИ ПРОФИЛЯ =====
+# =========================
+STYLE_PRESETS = {
+    None: {  # базовый, если фона нет
+        "header": "• ПРОФИЛЬ •",
+        "divider": "--------------------",
+        "icons": {"bal": "💰", "period": "📊", "total": "🏁", "upg": "⚡", "rw": "💎", "vip": "🎖"},
+        "order": ["vip", "divider", "bal", "period", "total", "upg", "rw", "divider", "reset"],
+    },
+    "DARK": {
+        "header": "░░░ 🌑 ТЁМНЫЙ ПРОФИЛЬ ░░░",
+        "divider": "░░░░░░░░░░",
+        "icons": {"bal": "⛓", "period": "⛓", "total": "⛓", "upg": "⛓", "rw": "⛓", "vip": "⛓"},
+        "order": ["vip", "divider", "bal", "period", "total", "upg", "rw", "divider", "reset"],
+    },
+    "FIRE": {
+        "header": "🔥🔥🔥 ОГНЕННЫЙ ПРОФИЛЬ 🔥🔥🔥",
+        "divider": "━━━━━━━━━━━━",
+        "icons": {"bal": "🔥", "period": "🔥", "total": "🔥", "upg": "🔥", "rw": "🔥", "vip": "🔥"},
+        "order": ["vip", "divider", "bal", "rw", "period", "upg", "total", "divider", "reset"],
+    },
+    "CRYSTAL": {
+        "header": "✦✧✦ КРИСТАЛЬНЫЙ ПРОФИЛЬ ✦✧✦",
+        "divider": "✧✧✧✧✧✧✧",
+        "icons": {"bal": "💎", "period": "✧", "total": "✧", "upg": "✦", "rw": "✦", "vip": "👑"},
+        "order": ["vip", "divider", "bal", "upg", "rw", "period", "total", "divider", "reset"],
+    },
+    "ICE": {
+        "header": "❄❄❄ ЛЕДЯНОЙ ПРОФИЛЬ ❄❄❄",
+        "divider": "═══════",
+        "icons": {"bal": "❄", "period": "❄", "total": "❄", "upg": "❄", "rw": "❄", "vip": "❄"},
+        "order": ["vip", "divider", "period", "total", "bal", "upg", "rw", "divider", "reset"],
+    },
+    "NEWYEAR": {
+        "header": "🎄✨ НОВОГОДНИЙ ПРОФИЛЬ ✨🎄",
+        "divider": "✨✨✨✨✨✨",
+        "icons": {"bal": "🎁", "period": "❄", "total": "❄", "upg": "⭐", "rw": "⭐", "vip": "🎄"},
+        "order": ["vip", "divider", "bal", "period", "upg", "total", "rw", "divider", "reset"],
+    },
+    "CHOC": {
+        "header": "🍫 ШОКОЛАДНЫЙ ПРОФИЛЬ 🍫",
+        "divider": "▬▬▬▬▬▬▬",
+        "icons": {"bal": "🍫", "period": "☕", "total": "☕", "upg": "🍩", "rw": "🍫", "vip": "🍪"},
+        "order": ["vip", "divider", "bal", "period", "total", "upg", "rw", "divider", "reset"],
+    },
+    "TOP": {
+        "header": "⭐️⭐️⭐️ ТОП ПРОФИЛЬ ⭐️⭐️⭐️",
+        "divider": "★★★★★★★",
+        "icons": {"bal": "⭐", "period": "🏆", "total": "🏆", "upg": "⚜", "rw": "⭐", "vip": "👑"},
+        "order": ["vip", "divider", "total", "bal", "upg", "period", "rw", "divider", "reset"],
+    },
+}
+
 # =========================
 # ===== ВСПОМОГАТЕЛЬНОЕ ===
 # =========================
@@ -716,6 +673,19 @@ async def is_subscribed(bot, user_id: int) -> bool:
     except Exception:
         return False
 
+async def require_subscribed(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    # ключевой гейт: если не подписан — не даём играть
+    sub = await is_subscribed(context.bot, user_id)
+    db_exec("UPDATE users SET subscribed=%s WHERE id=%s", (1 if sub else 0, user_id))
+    if not sub:
+        await safe_reply(
+            update,
+            f"🔔 Подпишись на канал:\n{CHANNEL_ID}\n\nПосле подписки нажми «✅ Я подписался»",
+            reply_markup=subscribe_menu(),
+        )
+        return False
+    return True
+
 def can_take_daily(last_daily_bonus: Optional[str]) -> Tuple[bool, Optional[timedelta]]:
     if not last_daily_bonus:
         return True, None
@@ -734,9 +704,7 @@ def parse_duration(value: str, unit: str) -> Optional[timedelta]:
         v = int(value)
     except Exception:
         return None
-
     u = (unit or "").strip().lower()
-
     if u in ("м", "мин", "минут", "минуты", "minute", "minutes", "min"):
         return timedelta(minutes=v)
     if u in ("ч", "час", "часа", "часов", "hour", "hours", "h"):
@@ -760,51 +728,20 @@ def parse_duration(value: str, unit: str) -> Optional[timedelta]:
             return timedelta(days=int(raw[:-1]))
         except Exception:
             return None
-
     return None
 
 def is_infinity(s: str) -> bool:
     return s.strip().lower() in ("infinity", "inf", "♾️", "♾", "navsegda", "навсегда")
 
-def check_and_update_vip(user_id: int) -> Tuple[Optional[str], Optional[datetime]]:
-    row = db_fetchone("SELECT vip_type, vip_until, vip_base_limit FROM users WHERE id=%s", (user_id,))
-    if not row:
-        return None, None
-
-    vip_type, vip_until, vip_base_limit = row
-    if not vip_type or not vip_until:
-        return None, None
-
-    try:
-        until_dt = datetime.fromisoformat(vip_until)
-    except Exception:
-        db_exec("UPDATE users SET vip_type=NULL, vip_until=NULL, vip_base_limit=NULL WHERE id=%s", (user_id,))
-        return None, None
-
-    now = datetime.now()
-    if now >= until_dt:
-        db_exec("UPDATE users SET vip_type=NULL, vip_until=NULL, vip_base_limit=NULL WHERE id=%s", (user_id,))
-        return None, None
-
-    return vip_type, until_dt
-
-def get_subscribed_ref_count(referrer_id: int) -> int:
-    row = db_fetchone(
-        """
-        SELECT COUNT(*)
-        FROM referrals r
-        JOIN users u ON u.id = r.user_id
-        WHERE r.referrer_id=%s AND u.subscribed=1
-        """,
-        (referrer_id,),
+def ensure_user(user_id: int, username: Optional[str] = None):
+    db_exec("INSERT INTO users (id) VALUES (%s) ON CONFLICT (id) DO NOTHING", (user_id,))
+    if username is not None:
+        db_exec("UPDATE users SET username=%s WHERE id=%s", (username, user_id))
+    db_exec(
+        "INSERT INTO user_titles (user_id, title_code, until) VALUES (%s,%s,NULL) "
+        "ON CONFLICT (user_id, title_code) DO NOTHING",
+        (user_id, "ROOKIE"),
     )
-    return int(row[0]) if row else 0
-
-def user_link_html(user_id: int, username: Optional[str]) -> str:
-    if username:
-        safe_u = html.escape(username)
-        return f"@{safe_u}"
-    return f'<a href="tg://user?id={user_id}">{user_id}</a>'
 
 def get_active_title(user_id: int) -> str:
     row = db_fetchone("SELECT active_title FROM users WHERE id=%s", (user_id,))
@@ -812,6 +749,30 @@ def get_active_title(user_id: int) -> str:
     if code not in TITLE_NAMES:
         return "ROOKIE"
     return code
+
+def user_link_html(user_id: int, username: Optional[str]) -> str:
+    if username:
+        safe_u = html.escape(username)
+        return f"@{safe_u}"
+    return f'<a href="tg://user?id={user_id}">{user_id}</a>'
+
+def check_and_update_vip(user_id: int) -> Tuple[Optional[str], Optional[datetime]]:
+    row = db_fetchone("SELECT vip_type, vip_until FROM users WHERE id=%s", (user_id,))
+    if not row:
+        return None, None
+    vip_type, vip_until = row
+    if not vip_type or not vip_until:
+        return None, None
+    try:
+        until_dt = datetime.fromisoformat(vip_until)
+    except Exception:
+        db_exec("UPDATE users SET vip_type=NULL, vip_until=NULL, vip_base_limit=NULL WHERE id=%s", (user_id,))
+        return None, None
+    now = datetime.now()
+    if now >= until_dt:
+        db_exec("UPDATE users SET vip_type=NULL, vip_until=NULL, vip_base_limit=NULL WHERE id=%s", (user_id,))
+        return None, None
+    return vip_type, until_dt
 
 def vip_frame_icon(vip_type: Optional[str]) -> str:
     if vip_type == "VIP":
@@ -821,34 +782,6 @@ def vip_frame_icon(vip_type: Optional[str]) -> str:
     if vip_type == "PREMIUM":
         return "🔥"
     return ""
-
-def profile_header(vip_type: Optional[str], theme_code: Optional[str]) -> str:
-    frame = vip_frame_icon(vip_type)
-    theme = THEME_ICON.get(theme_code or "", "")
-    left = f"{frame}{theme}".strip()
-    right = f"{theme}{frame}".strip()
-    core = "• ПРОФИЛЬ •"
-    if left and right:
-        return f"{left} {core} {right}"
-    if left:
-        return f"{left} {core}"
-    if right:
-        return f"{core} {right}"
-    return core
-
-def cosmetic_cooldown_left(user_id: int) -> int:
-    row = db_fetchone("SELECT last_cosmetic_change FROM users WHERE id=%s", (user_id,))
-    if not row or not row[0]:
-        return 0
-    try:
-        last = datetime.fromisoformat(row[0])
-    except Exception:
-        return 0
-    left = COSMETIC_CHANGE_COOLDOWN_SEC - int((datetime.now() - last).total_seconds())
-    return max(0, left)
-
-def set_cosmetic_touch(user_id: int):
-    db_exec("UPDATE users SET last_cosmetic_change=%s WHERE id=%s", (now_iso(), user_id))
 
 def ensure_progress_titles(user_id: int):
     row = db_fetchone("SELECT COALESCE(total_clicks,0) FROM users WHERE id=%s", (user_id,))
@@ -880,16 +813,17 @@ def get_effective_limits_and_reward(user_id: int) -> Tuple[int, int]:
 def check_click_reset(user_id: int) -> Tuple[int, datetime]:
     row = db_fetchone("SELECT last_click_reset, clicks_used FROM users WHERE id=%s", (user_id,))
     now = datetime.now()
-
     if not row or row[0] is None:
-        db_exec("UPDATE users SET last_click_reset=%s, clicks_used=0 WHERE id=%s", (now.strftime("%Y-%m-%d %H:%M:%S"), user_id))
+        db_exec("UPDATE users SET last_click_reset=%s, clicks_used=0 WHERE id=%s",
+                (now.strftime("%Y-%m-%d %H:%M:%S"), user_id))
         return 0, now + timedelta(hours=CLICK_RESET_HOURS)
 
     last_reset = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
     next_reset = last_reset + timedelta(hours=CLICK_RESET_HOURS)
 
     if now >= next_reset:
-        db_exec("UPDATE users SET last_click_reset=%s, clicks_used=0 WHERE id=%s", (now.strftime("%Y-%m-%d %H:%M:%S"), user_id))
+        db_exec("UPDATE users SET last_click_reset=%s, clicks_used=0 WHERE id=%s",
+                (now.strftime("%Y-%m-%d %H:%M:%S"), user_id))
         return 0, now + timedelta(hours=CLICK_RESET_HOURS)
 
     return int(row[1]), next_reset
@@ -945,6 +879,32 @@ def casino_cooldown_left(user_id: int) -> int:
 def set_casino_touch(user_id: int):
     db_exec("UPDATE users SET last_casino_play=%s WHERE id=%s", (now_iso(), user_id))
 
+def cosmetic_cooldown_left(user_id: int) -> int:
+    row = db_fetchone("SELECT last_cosmetic_change FROM users WHERE id=%s", (user_id,))
+    if not row or not row[0]:
+        return 0
+    try:
+        last = datetime.fromisoformat(row[0])
+    except Exception:
+        return 0
+    left = COSMETIC_CHANGE_COOLDOWN_SEC - int((datetime.now() - last).total_seconds())
+    return max(0, left)
+
+def set_cosmetic_touch(user_id: int):
+    db_exec("UPDATE users SET last_cosmetic_change=%s WHERE id=%s", (now_iso(), user_id))
+
+def get_subscribed_ref_count(referrer_id: int) -> int:
+    row = db_fetchone(
+        """
+        SELECT COUNT(*)
+        FROM referrals r
+        JOIN users u ON u.id = r.user_id
+        WHERE r.referrer_id=%s AND u.subscribed=1
+        """,
+        (referrer_id,),
+    )
+    return int(row[0]) if row else 0
+
 def weighted_choice(items):
     total = sum(w for *_rest, w in items)
     r = random.randint(1, total)
@@ -973,11 +933,116 @@ def vip_apply_reward(user_id: int, vip_type: str, amount: int, unit: str) -> Tup
     else:
         new_until = now + dur
 
-    db_exec(
-        "UPDATE users SET vip_type=%s, vip_until=%s WHERE id=%s",
-        (vip_type, new_until.isoformat(), user_id),
-    )
+    db_exec("UPDATE users SET vip_type=%s, vip_until=%s WHERE id=%s", (vip_type, new_until.isoformat(), user_id))
     return True, f"Вы получили VIP: {vip_type} на {amount} {unit} ✅"
+
+# =========================
+# ===== АНТИКЛИКЕР ЛОГИКА ==
+# =========================
+def _parse_buf_csv(s: Optional[str]) -> List[float]:
+    if not s:
+        return []
+    out = []
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(float(part))
+        except Exception:
+            continue
+    return out
+
+def _buf_to_csv(buf: List[float]) -> str:
+    return ",".join(f"{x:.3f}" for x in buf)
+
+def human_lock_enabled(user_id: int) -> bool:
+    row = db_fetchone("SELECT human_lock FROM users WHERE id=%s", (user_id,))
+    return bool(row and int(row[0]) == 1)
+
+async def maybe_send_human_lock(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    # чтобы не спамить "подтверди" при каждом сообщении
+    row = db_fetchone("SELECT human_lock_sent_at FROM users WHERE id=%s", (user_id,))
+    last = row[0] if row else None
+    now = datetime.now()
+
+    send = True
+    if last:
+        try:
+            last_dt = datetime.fromisoformat(last)
+            if (now - last_dt).total_seconds() < 6:
+                send = False
+        except Exception:
+            send = True
+
+    if send:
+        db_exec("UPDATE users SET human_lock_sent_at=%s WHERE id=%s", (now_iso(), user_id))
+        await safe_reply(update, "❗️Подтверди, что ты человек", reply_markup=human_check_markup())
+
+def click_rate_and_autoclick_check(user_id: int) -> Tuple[bool, bool]:
+    """
+    returns (allow_click, triggered_human_check_now)
+    - allow_click False if too fast OR locked
+    - triggered True if we just enabled lock now
+    """
+    row = db_fetchone(
+        "SELECT last_click_at, click_intv_buf, suspicious_clicks, human_lock FROM users WHERE id=%s",
+        (user_id,),
+    )
+    last_click_at, buf_csv, susp, lock = row if row else (None, None, 0, 0)
+
+    if int(lock or 0) == 1:
+        return False, False
+
+    now = datetime.now()
+
+    if last_click_at:
+        try:
+            last_dt = datetime.fromisoformat(last_click_at)
+        except Exception:
+            last_dt = None
+    else:
+        last_dt = None
+
+    if last_dt is None:
+        db_exec("UPDATE users SET last_click_at=%s WHERE id=%s", (now_iso(), user_id))
+        return True, False
+
+    delta = (now - last_dt).total_seconds()
+
+    # антиспам: минимум 0.55 сек
+    if delta < CLICK_MIN_INTERVAL_SEC:
+        return False, False
+
+    # обновляем интервалы
+    buf = _parse_buf_csv(buf_csv)
+    buf.append(delta)
+    if len(buf) > HUMAN_CHECK_K:
+        buf = buf[-HUMAN_CHECK_K:]
+    db_exec("UPDATE users SET last_click_at=%s, click_intv_buf=%s WHERE id=%s", (now_iso(), _buf_to_csv(buf), user_id))
+
+    # проверка ровности (только если буфер заполнен)
+    triggered = False
+    susp = int(susp or 0)
+
+    if len(buf) >= HUMAN_CHECK_K:
+        avg = sum(buf[-HUMAN_CHECK_K:]) / HUMAN_CHECK_K
+        max_dev = max(abs(x - avg) for x in buf[-HUMAN_CHECK_K:])
+        # критерий "очень ровно"
+        if max_dev <= HUMAN_CHECK_EPS:
+            susp += 1
+        else:
+            # мягкий спад, чтобы не было вечной подозрительности
+            susp = max(0, susp - 1)
+
+        if susp >= HUMAN_CHECK_TRIGGER:
+            # включаем блокировку
+            db_exec("UPDATE users SET human_lock=1, suspicious_clicks=0 WHERE id=%s", (user_id,))
+            triggered = True
+        else:
+            db_exec("UPDATE users SET suspicious_clicks=%s WHERE id=%s", (susp, user_id))
+
+    return True, triggered
 
 # =========================
 # ===== СТАРТ =============
@@ -1001,9 +1066,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+    # подписка — обязательна
     subscribed = await is_subscribed(context.bot, user_id)
     db_exec("UPDATE users SET subscribed=%s WHERE id=%s", (1 if subscribed else 0, user_id))
-
     if not subscribed:
         await safe_reply(
             update,
@@ -1014,8 +1079,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     check_click_reset(user_id)
     case_reset_if_needed(user_id)
+
+    # чистим session state
     context.user_data.clear()
     context.user_data["menu"] = "main"
+
     await safe_reply(update, "✨ Добро пожаловать!", reply_markup=main_menu(user_id))
 
 # =========================
@@ -1042,25 +1110,45 @@ async def send_profile_message(chat, context: ContextTypes.DEFAULT_TYPE, user_id
     used, next_reset = check_click_reset(user_id)
     limit, reward = get_effective_limits_and_reward(user_id)
 
+    preset = STYLE_PRESETS.get(active_theme, STYLE_PRESETS[None])
+    header = preset["header"]
+    divider = preset["divider"]
+    icons = preset["icons"]
+    order = preset["order"]
+
     title_name = TITLE_NAMES.get(active_title, active_title)
-    nick = f"[{title_name}] {user_link_html(user_id, stored_username)}"
+    nick_link = user_link_html(user_id, stored_username)
+
+    # VIP рамка вокруг ника (как мы утвердили)
+    frame = vip_frame_icon(vip_type)
+    if frame:
+        nick_line = f"{frame} [{html.escape(title_name)}] {nick_link} {frame}"
+    else:
+        nick_line = f"[{html.escape(title_name)}] {nick_link}"
+
     vip_status_text = vip_type if vip_type else "нет"
-    vip_left_text = format_time_left(vip_until_dt - datetime.now()) if vip_until_dt else "нет VIP статуса"
+    vip_left_text = format_time_left(vip_until_dt - datetime.now()) if vip_until_dt else "—"
 
-    header = profile_header(vip_type, active_theme)
+    lines = [header, "", nick_line, ""]
+    blocks = {
+        "vip": [
+            f"{icons['vip']} VIP статус: {vip_status_text}",
+            f"{icons['vip']} Срок VIP: {vip_left_text}",
+        ],
+        "bal": [f"{icons['bal']} Баланс: {int(float(bal))} GOLD"],
+        "period": [f"{icons['period']} Клики (за период): {used}/{limit}"],
+        "total": [f"{icons['total']} Клики (всего): {int(total_clicks)}"],
+        "upg": [f"{icons['upg']} Улучшение: {int(lvl)}/{UPGRADE_MAX}"],
+        "rw": [f"{icons['rw']} Награда за клик: +{reward} GOLD"],
+        "reset": [f"⏳ До обновления кликов: {format_time_left(next_reset - datetime.now())}"],
+        "divider": [divider],
+    }
 
-    text = (
-        f"{header}\n\n"
-        f"Ваш ник: {nick}\n"
-        f"VIP статус: {vip_status_text}\n"
-        f"Срок VIP статуса: {vip_left_text}\n"
-        f"⚡ Уровень улучшения: {int(lvl)}/{UPGRADE_MAX}\n\n"
-        f"💰 Баланс: {round(float(bal), 2)} GOLD\n"
-        f"📊 Клики (за период): {used}/{limit}\n"
-        f"🏁 Клики (всего): {int(total_clicks)}\n"
-        f"💎 Награда за клик: +{reward} GOLD\n"
-        f"⏳ До обновления: {format_time_left(next_reset - datetime.now())}"
-    )
+    for key in order:
+        for s in blocks.get(key, []):
+            lines.append(s)
+
+    text = "\n".join(lines)
 
     await chat.reply_text(
         text,
@@ -1085,6 +1173,32 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = q.from_user.id
     username = q.from_user.username
     ensure_user(user_id, username=username)
+
+    # human-lock: блокируем всё, кроме подтверждения
+    if q.data != "human_ok" and human_lock_enabled(user_id):
+        # не редактируем старое — просто шлём сообщение
+        fake_update = Update(update.update_id, message=q.message)  # чтобы safe_reply работал одинаково
+        await maybe_send_human_lock(fake_update, context, user_id)
+        return
+
+    # подтверждение "Я ЧЕЛОВЕК"
+    if q.data == "human_ok":
+        db_exec("UPDATE users SET human_lock=0, human_lock_sent_at=NULL, suspicious_clicks=0 WHERE id=%s", (user_id,))
+        try:
+            await q.message.reply_text("✅ Спасибо! Проверка пройдена. Можно продолжать.")
+        except Exception:
+            pass
+        return
+
+    # подписка — обязательна и для инлайна
+    # (кнопка "⬅️ Назад" и любые фичи — только подписанным)
+    # исключение: пользователь может быть в процессе подписки через клавиатуру
+    # тут — жёстко гейт
+    fake_update = Update(update.update_id, message=q.message)
+    ok_sub = await require_subscribed(fake_update, context, user_id)
+    if not ok_sub:
+        return
+
     check_and_update_vip(user_id)
     ensure_progress_titles(user_id)
 
@@ -1171,10 +1285,8 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        db_exec(
-            "UPDATE users SET balance=balance+%s, last_daily_bonus=%s WHERE id=%s",
-            (DAILY_BONUS_AMOUNT, now_iso(), user_id),
-        )
+        db_exec("UPDATE users SET balance=balance+%s, last_daily_bonus=%s WHERE id=%s",
+                (DAILY_BONUS_AMOUNT, now_iso(), user_id))
         await q.message.reply_text(f"✅ Ежедневный бонус получен: +{DAILY_BONUS_AMOUNT} GOLD 🎁")
         return
 
@@ -1297,12 +1409,12 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db_exec("UPDATE users SET balance=balance+%s WHERE id=%s", (amount, user_id))
             await q.message.reply_text(f"🎉 Выпало: +{amount} GOLD ✅")
         else:
-            vip_type, amt, unit = drop_value
-            ok, text_ = vip_apply_reward(user_id, vip_type, int(amt), unit)
-            if ok:
-                await q.message.reply_text(f"🎉 Выпало: {vip_type} ✅\n{text_}")
+            vip_type_, amt, unit = drop_value
+            ok_, text_ = vip_apply_reward(user_id, vip_type_, int(amt), unit)
+            if ok_:
+                await q.message.reply_text(f"🎉 Выпало: {vip_type_} ✅\n{text_}")
             else:
-                await q.message.reply_text(f"🎉 Выпало: {vip_type}\n{text_}")
+                await q.message.reply_text(f"🎉 Выпало: {vip_type_}\n{text_}")
 
         row2 = db_fetchone("SELECT cases_common, cases_rare, cases_legend FROM users WHERE id=%s", (user_id,))
         c, r, l = row2 if row2 else (0, 0, 0)
@@ -1516,7 +1628,6 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         db_exec("UPDATE users SET balance=balance-%s WHERE id=%s", (bet, user_id))
-
         set_casino_touch(user_id)
         context.user_data["casino_step"] = "rolling"
 
@@ -1536,23 +1647,14 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if game == "bigsmall":
             is_big = value >= 4
-            if pick == "big" and is_big:
-                win = True
-            if pick == "small" and not is_big:
-                win = True
+            win = (pick == "big" and is_big) or (pick == "small" and not is_big)
             result_text = f"Выпало: {value} ({'Больше' if is_big else 'Меньше'})"
-
         elif game == "evenodd":
             is_even = (value % 2 == 0)
-            if pick == "even" and is_even:
-                win = True
-            if pick == "odd" and not is_even:
-                win = True
+            win = (pick == "even" and is_even) or (pick == "odd" and not is_even)
             result_text = f"Выпало: {value} ({'Чёт' if is_even else 'Нечёт'})"
-
         else:
-            if pick.isdigit() and int(pick) == value:
-                win = True
+            win = (pick.isdigit() and int(pick) == value)
             result_text = f"Выпало: {value}"
 
         coef = CASINO_COEF[game]
@@ -1710,7 +1812,6 @@ async def admin_process_withdraw_decision(update: Update, context: ContextTypes.
     return False
 
 def format_codes_list() -> str:
-    # список кодов для админа
     t_lines = ["🏷 TITLES (TITLE_CODE → название):"]
     for code, name in sorted(TITLE_NAMES.items()):
         t_lines.append(f"• {code} → {name}")
@@ -1740,12 +1841,39 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     check_and_update_vip(user_id)
     ensure_progress_titles(user_id)
 
+    # human-lock: пока не подтвердит — ничего не даём делать (кроме /start и подписки)
+    if human_lock_enabled(user_id):
+        if text not in ("✅ Я подписался", "/start", "🔙 Назад", "❌ Отмена"):
+            await maybe_send_human_lock(update, context, user_id)
+            return
+
     # бан (кроме админа)
     if not is_admin(user_id):
         r = db_fetchone("SELECT banned FROM users WHERE id=%s", (user_id,))
         if r and int(r[0]) == 1:
             await safe_reply(update, "⛔ Вы заблокированы.")
             return
+
+    # ПОДПИСКА (кнопка)
+    if text == "✅ Я подписался":
+        subscribed = await is_subscribed(context.bot, user_id)
+        db_exec("UPDATE users SET subscribed=%s WHERE id=%s", (1 if subscribed else 0, user_id))
+        if subscribed:
+            await safe_reply(update, "✅ Подписка подтверждена!", reply_markup=main_menu(user_id))
+        else:
+            await safe_reply(update, "❌ Ты ещё не подписался!", reply_markup=subscribe_menu())
+        return
+
+    # /start (как текст) — на всякий случай
+    if text == "/start":
+        await start(update, context)
+        return
+
+    # ГЛОБАЛЬНАЯ ПРОВЕРКА ПОДПИСКИ (везде, не только /start)
+    # исключение: сам процесс подписки уже обработан выше
+    ok_sub = await require_subscribed(update, context, user_id)
+    if not ok_sub:
+        return
 
     # НАЗАД / ОТМЕНА
     if text in ["🔙 Назад", "❌ Отмена"]:
@@ -1757,16 +1885,6 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         context.user_data.clear()
         await safe_reply(update, "Главное меню", reply_markup=main_menu(user_id))
-        return
-
-    # ПОДПИСКА
-    if text == "✅ Я подписался":
-        subscribed = await is_subscribed(context.bot, user_id)
-        db_exec("UPDATE users SET subscribed=%s WHERE id=%s", (1 if subscribed else 0, user_id))
-        if subscribed:
-            await safe_reply(update, "✅ Подписка подтверждена!", reply_markup=main_menu(user_id))
-        else:
-            await safe_reply(update, "❌ Ты ещё не подписался!", reply_markup=subscribe_menu())
         return
 
     # ПРОФИЛЬ
@@ -1788,6 +1906,19 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # КЛИК
     if text == "👆 КЛИК" and context.user_data.get("earning"):
+        # антиспам + антиавтокликер
+        allow, triggered = click_rate_and_autoclick_check(user_id)
+        if not allow:
+            # если включился human-lock — покажем проверку один раз
+            if human_lock_enabled(user_id):
+                await maybe_send_human_lock(update, context, user_id)
+            # слишком быстро — молча игнор (чтобы не ложить бота)
+            return
+
+        if triggered and human_lock_enabled(user_id):
+            await maybe_send_human_lock(update, context, user_id)
+            return
+
         used, _ = check_click_reset(user_id)
         limit, reward = get_effective_limits_and_reward(user_id)
         if used >= limit:
@@ -2274,5 +2405,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
