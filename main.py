@@ -584,19 +584,19 @@ STYLE_PRESETS = {
         "order": ["vip", "divider", "bal", "period", "total", "upg", "rw", "divider", "reset"],
     },
     "FIRE": {
-        "header": "🔥🔥🔥 ОГНЕННЫЙ ПРОФИЛЬ 🔥🔥🔥",
+        "header": "🔥🔥 ОГНЕННЫЙ ПРОФИЛЬ 🔥🔥",
         "divider": "━━━━━━━━━━━━",
         "icons": {"bal": "🔥", "period": "🔥", "total": "🔥", "upg": "🔥", "rw": "🔥", "vip": "🔥"},
         "order": ["vip", "divider", "bal", "rw", "period", "upg", "total", "divider", "reset"],
     },
     "CRYSTAL": {
-        "header": "✦✧✦ КРИСТАЛЬНЫЙ ПРОФИЛЬ ✦✧✦",
+        "header": "✧✦ КРИСТАЛЬНЫЙ ПРОФИЛЬ ✦✧",
         "divider": "✧✧✧✧✧✧✧",
         "icons": {"bal": "💎", "period": "✧", "total": "✧", "upg": "✦", "rw": "✦", "vip": "👑"},
         "order": ["vip", "divider", "bal", "upg", "rw", "period", "total", "divider", "reset"],
     },
     "ICE": {
-        "header": "❄❄❄ ЛЕДЯНОЙ ПРОФИЛЬ ❄❄❄",
+        "header": "❄❄ ЛЕДЯНОЙ ПРОФИЛЬ ❄❄",
         "divider": "═══════",
         "icons": {"bal": "❄", "period": "❄", "total": "❄", "upg": "❄", "rw": "❄", "vip": "❄"},
         "order": ["vip", "divider", "period", "total", "bal", "upg", "rw", "divider", "reset"],
@@ -614,7 +614,7 @@ STYLE_PRESETS = {
         "order": ["vip", "divider", "bal", "period", "total", "upg", "rw", "divider", "reset"],
     },
     "TOP": {
-        "header": "⭐️⭐️⭐️ ТОП ПРОФИЛЬ ⭐️⭐️⭐️",
+        "header": "⭐️⭐️ ТОП ПРОФИЛЬ ⭐️⭐️",
         "divider": "★★★★★★★",
         "icons": {"bal": "⭐", "period": "🏆", "total": "🏆", "upg": "⚜", "rw": "⭐", "vip": "👑"},
         "order": ["vip", "divider", "total", "bal", "upg", "period", "rw", "divider", "reset"],
@@ -2405,3 +2405,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
